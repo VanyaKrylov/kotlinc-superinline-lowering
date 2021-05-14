@@ -15,7 +15,6 @@ import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.*
 import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
-import org.jetbrains.kotlin.ir.symbols.impl.IrReturnableBlockSymbolImpl
 import org.jetbrains.kotlin.ir.types.IrSimpleType
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.typeOrNull
@@ -25,142 +24,77 @@ import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
 import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.util.OperatorNameConventions
-import java.util.Collections.addAll
+import org.jetbrains.kotlin.utils.addToStdlib.safeAs
 
+fun IrFunctionAccessExpression.isLambdaInvokeCall(): Boolean {
+    val callee = this.symbol.owner
+    val dispatchReceiverParameter = callee.dispatchReceiverParameter ?: return false
+    val dispatchReceiverOrigin = this.dispatchReceiver.safeAs<IrComposite>()?.origin ?: return false
 
-//todo test without lambda param - should work
+    return this is IrCall
+            && callee.name == OperatorNameConventions.INVOKE
+            && dispatchReceiverParameter.type.isFunction()
+            && dispatchReceiverOrigin is SuperInlineLowering.SuperInlinedFunctionBodyOrigin
+}
+
 class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass, IrElementTransformerVoidWithContext() {
     val superInlineAnnotationFqName: FqName = FqName("Script.SuperInline")
-
     private val IrFunction.needsInlining get() = this.isInline && !this.isExternal
-
     private var containerScope: ScopeWithIr? = null
+    private var isEnabled: Boolean = false
 
     override fun lower(irBody: IrBody, container: IrDeclaration) {
         containerScope = createScope(container as IrSymbolOwner)
         irBody.accept(this, null)
-
-        irBody.transform(object : IrElementTransformerVoidWithContext() {
-            var isTopLevelStatement: Boolean = false
-            val newStatements = mutableListOf<IrStatement>()
-
-            override fun visitDeclaration(declaration: IrDeclarationBase): IrStatement {
-                isTopLevelStatement = false
-                return super.visitDeclaration(declaration)
-            }
-
-            override fun visitExpression(expression: IrExpression): IrExpression {
-                isTopLevelStatement = false
-                expression.transformChildrenVoid()
-
-                return expression
-            }
-
-            override fun visitComposite(expression: IrComposite): IrExpression {
-                when(val origin = expression.origin) {
-                    is SuperInlinedFunctionBodyOrigin -> {
-                        if (!isTopLevelStatement) {
-                            val scopeWithIr = currentScope ?: containerScope
-                            val tmpVar = scopeWithIr!!.scope.createTemporaryVariableDeclaration(expression.type, origin.calleeName)
-                            expression.transformChildren(object : IrElementTransformerVoid() {
-                                override fun visitReturn(expression: IrReturn): IrExpression {
-                                    return if(expression.returnTargetSymbol == scopeWithIr.scope.scopeOwnerSymbol)
-                                        IrSetValueImpl( //todo FIX! Only returns from this
-                                            expression.startOffset,
-                                            expression.endOffset,
-                                            expression.type,
-                                            tmpVar.symbol,
-                                            expression.value,
-                                            null
-                                        ) else
-                                            expression
-                                }
-                            }, null)
-                            newStatements.apply {
-                                add(tmpVar)
-                                addAll(expression.statements)
-                            }
-                            return IrGetValueImpl(expression.startOffset, expression.endOffset, tmpVar.symbol, null)
-                        } else
-                            return IrCompositeImpl(
-                                expression.startOffset,
-                                expression.endOffset,
-                                expression.type,
-                                null,
-                                expression.statements
-                            )
-                    }
-                    else -> {
-                        isTopLevelStatement = false
-                        return super.visitComposite(expression)
-                    }
-                }
-            }
-
-            //TODO add support later
-            /*override fun visitExpressionBody(body: IrExpressionBody): IrBody {
-                body.transformChildrenVoid()
-                return super.visitExpressionBody(body)
-            }*/
-
-            override fun visitBlockBody(body: IrBlockBody): IrBody {
-                val indicesToNewStatements = mutableMapOf<Int,List<IrStatement>>()
-                body.statements.forEachIndexed { i, statement ->
-                    isTopLevelStatement = true
-                    body.statements[i] = statement.transform(this, null) as IrStatement
-                    if (newStatements.isNotEmpty()) {
-                        indicesToNewStatements.computeIfAbsent(i) { mutableListOf<IrStatement>().apply { addAll(newStatements) }}
-                        newStatements.clear()
-                    }
-                }
-                if (indicesToNewStatements.isNotEmpty()) {
-                    val extendedBodyStatements = mutableListOf<IrStatement>()
-                    for (i in body.statements.indices) {
-                        indicesToNewStatements[i]?.let { extendedBodyStatements.addAll(it) }
-                        extendedBodyStatements.add(body.statements[i])
-                    }
-                    return body.apply {
-                        statements.clear()
-                        statements.addAll(extendedBodyStatements)
-                    }
-                }
-
-                return body
-            }
-        }, null)
-
+        irBody.transform(InlinedIrCompositePostProcessingTransformer(containerScope!!), null)
         containerScope = null
 
         irBody.patchDeclarationParents(container as? IrDeclarationParent ?: container.parent)
     }
 
-    /*override fun lower(irFile: IrFile) {
-        irFile.accept(this, null)
-        irFile.patchDeclarationParents(irFile)
-    }*/
-
+    //todo use visitCall() instead?
     override fun visitFunctionAccess(expression: IrFunctionAccessExpression): IrExpression {
-        if (expression.symbol.owner.hasAnnotation(superInlineAnnotationFqName)) {
-            when(expression) {
-                /*is IrConstructorCall -> {
-                    expression.getArgumentsWithIr()
-                        .filter { it.second.type.isFunction() }
-                        .map { it.second.transform(object: IrElementTransformerVoid() {
-                            override fun visitFunctionExpression(expression: IrFunctionExpression): IrExpression {
-                                return expression.apply { this.function.transformChildren(this@SuperInlineLowering, null) }
-                            }
-                        }, null) }
-
-                    return expression
-                }*/
-
-                is IrCall -> return Inliner(expression, expression.symbol.owner, currentScope ?: containerScope!!, allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
-                    ?: allScopes.map { it.irElement }.filterIsInstance<IrDeclaration>().lastOrNull()?.parent ?: containerScope?.irElement as? IrDeclarationParent
-                    ?: (containerScope?.irElement as? IrDeclaration)?.parent, context).inline()//SuperInliningInliner(expression, expression.symbol.owner, currentScope, expression.symbol.owner.parent).inline()
-            }
+        //todo add isInline check
+        if (!expression.symbol.owner.hasAnnotation(superInlineAnnotationFqName) && !isEnabled && expression !is IrCall) {
+            return super.visitFunctionAccess(expression)
         }
 
-        return super.visitFunctionAccess(expression)
+        isEnabled = true
+        expression.transformChildrenVoid()
+
+        val parent = allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
+            ?: allScopes.map { it.irElement }.filterIsInstance<IrDeclaration>().lastOrNull()?.parent
+            ?: containerScope?.irElement as? IrDeclarationParent
+            ?: (containerScope?.irElement as? IrDeclaration)?.parent
+
+        val scope = currentScope ?: containerScope!!
+
+        val inliner = Inliner(expression, expression.symbol.owner, scope, parent, context)
+
+        if (expression.symbol.owner.hasAnnotation(superInlineAnnotationFqName)) {
+            val inlined = inliner.inline()
+            isEnabled = false
+
+            return inlined
+        }
+
+        val callSite = expression
+
+        //Assuming that only cases with isEnabled=true reach this code
+        return if (expression.isLambdaInvokeCall())
+            expression.dispatchReceiver!!.apply {
+                transformChildren(object : IrElementTransformerVoid() {
+                    override fun visitReturn(expression: IrReturn): IrExpression {
+                        //TODO add returnSymbol check once the Inliner is fixed to return IrReturnableBlock instead of IrComposite
+                        val function = expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
+
+                        return Inliner(callSite, function, scope, parent, context, true).inline()
+                    }
+                }, null)
+            }
+        else
+            inliner.inline()
+
     }
 
     private inner class Inliner(
@@ -168,7 +102,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val callee: IrFunction,
         val currentScope: ScopeWithIr,
         val parent: IrDeclarationParent?,
-        val context: CommonBackendContext
+        val context: CommonBackendContext,
+        val ignoreDispatchReceiver: Boolean = false,
+        val isTopLevelCallSite: Boolean = false
     ) {
 
         val copyIrElement = run {
@@ -205,15 +141,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         ): IrComposite {
             val copiedCallee = (copyIrElement.copy(callee) as IrFunction).apply {
                 parent = callee.parent
-                if (performRecursiveInline) {
-                    body?.transformChildrenVoid()
-                    valueParameters.forEachIndexed { index, param ->
-                        if (callSite.getValueArgument(index) == null) {
-                            // Default values can recursively reference [callee] - transform only needed.
-                            param.defaultValue = param.defaultValue?.transform(this@SuperInlineLowering, null)
-                        }
-                    }
-                }
             }
 
             val evaluationStatements = evaluateArguments(callSite, copiedCallee)
@@ -231,9 +158,14 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             val transformer = ParameterSubstitutor()
             statements.transform { it.transform(transformer, data = null) }
+            // Process chained invoke calls. It's needed to be done after the ParameterSubstitutor, because we need to have
+            // all the lambdas passed as parameter to be already inlined
+            // Example:
+            // lambdaParam.invoke().invoke() ==> (after ParameterSubstitutor) IrComposite( ... IrReturn(IrFuncExpr) ... ).invoke() ==> IrComposite( ... IrReturn ... )
+            statements.transform { it.transform(this@SuperInlineLowering, null) }
             statements.addAll(0, evaluationStatements)
 
-            return IrCompositeImpl( //TODO finish
+            return IrCompositeImpl( //TODO revert back to IrReturnableBlock due to semantics (the post-processing logic should also be reimplemented for this change)
                 callSite.startOffset,
                 callSite.endOffset,
                 callSite.type,
@@ -249,7 +181,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                         return expression
                     }
                 })
-                patchDeclarationParents(parent) // TODO: Why it is not enough to just run SetDeclarationsParentVisitor?
+                patchDeclarationParents(parent)
             }
 
             /*return IrReturnableBlockImpl(
@@ -300,102 +232,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 if ((dispatchReceiver.symbol.owner as? IrValueParameter)?.isNoinline == true)
                     return super.visitCall(expression)
 
-                if (functionArgument is IrFunctionReference) {
-                    functionArgument.transformChildrenVoid(this)
-
-                    val function = functionArgument.symbol.owner
-                    val functionParameters = function.explicitParameters
-                    val boundFunctionParameters = functionArgument.getArgumentsWithIr()
-                    val unboundFunctionParameters = functionParameters - boundFunctionParameters.map { it.first }
-                    val boundFunctionParametersMap = boundFunctionParameters.associate { it.first to it.second }
-
-                    var unboundIndex = 0
-                    val unboundArgsSet = unboundFunctionParameters.toSet()
-                    val valueParameters = expression.getArgumentsWithIr().drop(1) // Skip dispatch receiver.
-
-                    val superType = functionArgument.type as IrSimpleType
-                    val superTypeArgumentsMap = expression.symbol.owner.parentAsClass.typeParameters.associate { typeParam ->
-                        typeParam.symbol to superType.arguments[typeParam.index].typeOrNull!!
-                    }
-
-                    val immediateCall = with(expression) {
-                        when (function) {
-                            is IrConstructor -> {
-                                val classTypeParametersCount = function.parentAsClass.typeParameters.size
-                                IrConstructorCallImpl.fromSymbolOwner(
-                                    startOffset,
-                                    endOffset,
-                                    function.returnType,
-                                    function.symbol,
-                                    classTypeParametersCount
-                                )
-                            }
-                            is IrSimpleFunction ->
-                                IrCallImpl(
-                                    startOffset,
-                                    endOffset,
-                                    function.returnType,
-                                    function.symbol,
-                                    function.typeParameters.size,
-                                    function.valueParameters.size
-                                )
-                            else ->
-                                error("Unknown function kind : ${function.render()}")
-                        }
-                    }.apply {
-                        for (parameter in functionParameters) {
-                            val argument =
-                                if (parameter !in unboundArgsSet) {
-                                    val arg = boundFunctionParametersMap[parameter]!!
-                                    if (arg is IrGetValueWithoutLocation)
-                                        arg.withLocation(expression.startOffset, expression.endOffset)
-                                    else arg
-                                } else {
-                                    if (unboundIndex == valueParameters.size && parameter.defaultValue != null)
-                                        copyIrElement.copy(parameter.defaultValue!!.expression) as IrExpression
-                                    else if (!parameter.isVararg) {
-                                        assert(unboundIndex < valueParameters.size) {
-                                            "Attempt to use unbound parameter outside of the callee's value parameters"
-                                        }
-                                        valueParameters[unboundIndex++].second
-                                    } else {
-                                        val elements = mutableListOf<IrVarargElement>()
-                                        while (unboundIndex < valueParameters.size) {
-                                            val (param, value) = valueParameters[unboundIndex++]
-                                            val substitutedParamType = param.type.substitute(superTypeArgumentsMap)
-                                            if (substitutedParamType == parameter.varargElementType!!)
-                                                elements += value
-                                            else
-                                                elements += IrSpreadElementImpl(expression.startOffset, expression.endOffset, value)
-                                        }
-                                        IrVarargImpl(
-                                            expression.startOffset, expression.endOffset,
-                                            parameter.type,
-                                            parameter.varargElementType!!,
-                                            elements
-                                        )
-                                    }
-                                }
-                            when (parameter) {
-                                function.dispatchReceiverParameter ->
-                                    this.dispatchReceiver = argument.implicitCastIfNeededTo(function.dispatchReceiverParameter!!.type)
-
-                                function.extensionReceiverParameter ->
-                                    this.extensionReceiver = argument.implicitCastIfNeededTo(function.extensionReceiverParameter!!.type)
-
-                                else ->
-                                    putValueArgument(
-                                        parameter.index,
-                                        argument.implicitCastIfNeededTo(function.valueParameters[parameter.index].type)
-                                    )
-                            }
-                        }
-                        assert(unboundIndex == valueParameters.size) { "Not all arguments of the callee are used" }
-                        for (index in 0 until functionArgument.typeArgumentsCount)
-                            putTypeArgument(index, functionArgument.getTypeArgument(index))
-                    }.implicitCastIfNeededTo(expression.type)
-                    return this@SuperInlineLowering.visitExpression(super.visitExpression(immediateCall))
-                }
                 if (functionArgument !is IrFunctionExpression)
                     return super.visitCall(expression)
 
@@ -442,8 +278,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             val isInlinableLambdaArgument: Boolean
                 get() = parameter.isInlineParameter() &&
-                        (argumentExpression is IrFunctionReference
-                                || argumentExpression is IrFunctionExpression)
+                        argumentExpression is IrFunctionExpression //todo add support for FunctionReferences
 
             val isImmutableVariableLoad: Boolean
                 get() = argumentExpression.let { argument ->
@@ -453,10 +288,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         // callee might be a copied version of callsite.symbol.owner
         private fun buildParameterToArgument(callSite: IrFunctionAccessExpression, callee: IrFunction): List<ParameterToArgument> {
-
             val parameterToArgument = mutableListOf<ParameterToArgument>()
 
-            if (callSite.dispatchReceiver != null && callee.dispatchReceiverParameter != null)
+            if (callSite.dispatchReceiver != null && callee.dispatchReceiverParameter != null && !ignoreDispatchReceiver)
                 parameterToArgument += ParameterToArgument(
                     parameter = callee.dispatchReceiverParameter!!,
                     argumentExpression = callSite.dispatchReceiver!!
@@ -567,14 +401,21 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             val evaluationStatements = mutableListOf<IrStatement>()
             val substitutor = ParameterSubstitutor()
             arguments.forEach { argument ->
+                //argument.argumentExpression.transform(this@SuperInlineLowering, null)
+
                 /*
                  * We need to create temporary variable for each argument except inlinable lambda arguments.
                  * For simplicity and to produce simpler IR we don't create temporaries for every immutable variable,
                  * not only for those referring to inlinable lambdas.
                  */
-                if (argument.isInlinableLambdaArgument) {
+                /*if (argument.isInlinableLambdaArgument) {
                     substituteMap[argument.parameter] = argument.argumentExpression
                     (argument.argumentExpression as? IrFunctionReference)?.let { evaluationStatements += evaluateArguments(it) }
+                    return@forEach
+                }*/
+
+                if (argument.isInlinableLambdaArgument) {
+                    substituteMap[argument.parameter] = argument.argumentExpression
                     return@forEach
                 }
 
@@ -611,102 +452,106 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         }
     }
 
-    private inner class SuperInliningInliner(
-        val callSite: IrFunctionAccessExpression,
-        val callee: IrFunction,
-        val currentScope: ScopeWithIr?,
-        val parent: IrDeclarationParent
-    ) : IrElementTransformerVoid() {
-        val copyIrElement = run {
-            val typeParameters =
-                if (callee is IrConstructor)
-                    callee.parentAsClass.typeParameters
-                else callee.typeParameters
-            val typeArguments =
-                (0 until callSite.typeArgumentsCount).associate {
-                    typeParameters[it].symbol to callSite.getTypeArgument(it)
-                }
-            DeepCopyIrTreeWithSymbolsForInliner(typeArguments, parent)
+    class SuperInliner : IrElementTransformerVoidWithContext() {
+        override fun visitCall(expression: IrCall): IrExpression {
+            return super.visitCall(expression)
+        }
+    }
+
+    private class InlinedIrCompositePostProcessingTransformer(val containerScope: ScopeWithIr) : IrElementTransformerVoidWithContext() {
+        var isTopLevelStatement: Boolean = false
+        val newStatements = mutableListOf<IrStatement>()
+
+        override fun visitDeclaration(declaration: IrDeclarationBase): IrStatement {
+            isTopLevelStatement = false
+            return super.visitDeclaration(declaration)
         }
 
-        val evaluationStatements = mutableListOf<IrStatement>()
-        lateinit var copiedCalleeValueParamsToOldCalleeValueParams: Map<IrValueParameter,IrValueParameter>
+        override fun visitExpression(expression: IrExpression): IrExpression {
+            isTopLevelStatement = false
+            expression.transformChildrenVoid()
 
-        fun inline(): IrExpression {
-            //callee.transformChildrenVoid() //TODO revert cause we CAN'T change initial function(callee) declaration
-            val copiedCallee = (copyIrElement.copy(callee) as IrFunction).apply {
-                parent = callee.parent
-            }
-            copiedCalleeValueParamsToOldCalleeValueParams = copiedCallee.valueParameters.zip(callee.valueParameters).toMap()
-            if (callee.dispatchReceiverParameter != null && copiedCallee.dispatchReceiverParameter != null) {
-                copiedCalleeValueParamsToOldCalleeValueParams = copiedCalleeValueParamsToOldCalleeValueParams + (copiedCallee.dispatchReceiverParameter!! to callee.dispatchReceiverParameter!!)
-            }
-            if (callee.extensionReceiverParameter != null && copiedCallee.extensionReceiverParameter != null) {
-                copiedCalleeValueParamsToOldCalleeValueParams = copiedCalleeValueParamsToOldCalleeValueParams + (copiedCallee.extensionReceiverParameter!! to callee.extensionReceiverParameter!!)
-            }
-            copiedCallee.transformChildrenVoid()
-            val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl()
-            val endOffset = copiedCallee.endOffset
-            val irBuilder = context.createIrBuilder(irReturnableBlockSymbol, endOffset, endOffset)
-
-            return IrReturnableBlockImpl(
-                startOffset = callSite.startOffset,
-                endOffset = callSite.endOffset,
-                type = callSite.type,
-                symbol = irReturnableBlockSymbol,
-                origin = null,
-                statements = (copiedCallee.body!! as IrBlockBody).statements.apply { addAll(0, evaluationStatements) },
-                inlineFunctionSymbol = callee.symbol
-            ).apply {
-                transformChildrenVoid(object : IrElementTransformerVoid() {
-                    override fun visitReturn(expression: IrReturn): IrExpression {
-                        expression.transformChildrenVoid(this)
-
-                        if (expression.returnTargetSymbol == copiedCallee.symbol)
-                            return irBuilder.irReturn(expression.value)
-                        return expression
-                    }
-                })
-                patchDeclarationParents(parent)
-            }
+            return expression
         }
 
-        override fun visitGetValue(expression: IrGetValue): IrExpression {
-            return when(val arg = callSite.getArgumentsWithIr().find { it.first == copiedCalleeValueParamsToOldCalleeValueParams[expression.symbol.owner] }?.second) { //TODO with copied callee!
-                is IrConstructorCall -> arg
-                is Any -> {
-                    val newVariable =
-                        currentScope!!.scope.createTemporaryVariable(
-                            irExpression = IrBlockImpl(
-                                arg.startOffset,
-                                arg.endOffset,
-                                arg.type,
-                                InlinerExpressionLocationHint((currentScope.irElement as IrSymbolOwner).symbol)
-                            ).apply {
-                                statements.add(arg)
-                            },
-                            nameHint = callee.symbol.owner.name.toString(),
-                            isMutable = false
+        override fun visitComposite(expression: IrComposite): IrExpression { //todo rewrite for IrReturnableBlock
+            when (val origin = expression.origin) {
+                is SuperInlinedFunctionBodyOrigin -> {
+
+                    if (!isTopLevelStatement) {
+                        val scopeWithIr = currentScope ?: containerScope
+                        val tmpVar = scopeWithIr!!.scope.createTemporaryVariableDeclaration(expression.type, origin.calleeName)
+
+                        expression.transformChildren(object : IrElementTransformerVoid() {
+                            override fun visitReturn(expression: IrReturn): IrExpression {
+                                return if (expression.returnTargetSymbol == scopeWithIr.scope.scopeOwnerSymbol)
+                                    IrSetValueImpl(
+                                        expression.startOffset,
+                                        expression.endOffset,
+                                        expression.type,
+                                        tmpVar.symbol,
+                                        expression.value,
+                                        null
+                                    ) else
+                                    expression
+                            }
+                        }, null)
+
+                        newStatements.apply {
+                            add(tmpVar)
+                            addAll(expression.statements)
+                        }
+
+                        return IrGetValueImpl(expression.startOffset, expression.endOffset, tmpVar.symbol, null)
+                    } else
+                        return IrCompositeImpl(
+                            expression.startOffset,
+                            expression.endOffset,
+                            expression.type,
+                            null,
+                            expression.statements
                         )
-                    evaluationStatements.add(newVariable)
-
-                    return IrGetValueImpl(expression.startOffset, expression.endOffset, newVariable.symbol)
                 }
-                else -> expression
+                else -> {
+                    isTopLevelStatement = false
+                    return super.visitComposite(expression)
+                }
             }
-            /*return entrypointCall.getArgumentsWithIr()
-                .find { it.first == expression.symbol.owner }?.second
-                ?: super.visitGetValue(expression)*/
         }
 
-        /*override fun visitTypeParameter(declaration: IrTypeParameter): IrStatement {
-            TODO()
+        //TODO add support later
+        /*override fun visitExpressionBody(body: IrExpressionBody): IrBody {
+            body.transformChildrenVoid()
+            return super.visitExpressionBody(body)
         }*/
 
-        /*override fun visitFunctionAccess(expression: IrFunctionAccessExpression): IrExpression {
-            expression
-            return super.visitFunctionAccess(expression)
-        }*/
+        override fun visitBlockBody(body: IrBlockBody): IrBody {
+            val indicesToNewStatements = mutableMapOf<Int, List<IrStatement>>()
+
+            body.statements.forEachIndexed { i, statement ->
+                isTopLevelStatement = true
+                body.statements[i] = statement.transform(this, null) as IrStatement
+                if (newStatements.isNotEmpty()) {
+                    indicesToNewStatements.computeIfAbsent(i) { mutableListOf<IrStatement>().apply { addAll(newStatements) } }
+                    newStatements.clear()
+                }
+            }
+
+            if (indicesToNewStatements.isNotEmpty()) {
+                val extendedBodyStatements = mutableListOf<IrStatement>()
+                for (i in body.statements.indices) {
+                    indicesToNewStatements[i]?.let { extendedBodyStatements.addAll(it) }
+                    extendedBodyStatements.add(body.statements[i])
+                }
+
+                return body.apply {
+                    statements.clear()
+                    statements.addAll(extendedBodyStatements)
+                }
+            }
+
+            return body
+        }
     }
 
     private class IrGetValueWithoutLocation(
