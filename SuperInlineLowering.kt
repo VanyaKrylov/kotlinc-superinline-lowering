@@ -27,7 +27,7 @@ import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
 
 fun IrValueParameter.isSuperInlineParameter(type: IrType = this.type) =
-    index >= 0 && !isNoinline && !type.isNullable() && (type.isFunction() || type.isSuspendFunction())
+    !isNoinline && !type.isNullable() && (type.isFunction() || type.isSuspendFunction())
 
 fun IrFunctionAccessExpression.isInlinableLambdaInvokeCall(): Boolean {
     val callee = this.symbol.owner
@@ -52,16 +52,19 @@ fun IrFunctionAccessExpression.isInlinableExtensionLambdaCall(): Boolean {
 }
 
 class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass, IrElementTransformerVoidWithContext() {
-    val superInlineAnnotationFqName: FqName = FqName("Script.SuperInline")
+    val superInlineAnnotationFqName: FqName = FqName("Script.SuperInline") //TODO change
+    val superInlineAnnotationFqNameForCommandLine: FqName = FqName("SuperInline") //TODO change
     private val IrFunction.needsInlining get() = this.isInline && !this.isExternal
     private var containerScope: ScopeWithIr? = null
     private var isEnabled: Boolean = false
+    private var inliningTriggered: Boolean = false
 
     override fun lower(irBody: IrBody, container: IrDeclaration) {
         containerScope = createScope(container as IrSymbolOwner)
         irBody.accept(this, null)
         irBody.transform(InlinedIrCompositePostProcessingTransformer(containerScope!!), null)
         containerScope = null
+        inliningTriggered = false
 
         irBody.patchDeclarationParents(container as? IrDeclarationParent ?: container.parent)
     }
@@ -71,14 +74,17 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val callee = expression.symbol.owner
 
         if (!callee.hasAnnotation(superInlineAnnotationFqName) &&
-            !isEnabled &&
+            !callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine) &&
+            !isEnabled ||
             expression !is IrCall ||
-            callee is IrLazyFunction) {
+            callee is IrLazyFunction
+        ) {
 
             return super.visitFunctionAccess(expression)
         }
 
         isEnabled = true //TODO change to true
+        inliningTriggered = true
         expression.transformChildrenVoid() //TODO uncomment
 
         val parent = allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
@@ -90,7 +96,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         val inliner = Inliner(expression, callee, scope, parent, context)
 
-        if (expression.symbol.owner.hasAnnotation(superInlineAnnotationFqName)) {
+        if (callee.hasAnnotation(superInlineAnnotationFqName) ||
+            callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine)
+        ) {
             val inlined = inliner.inline()
             isEnabled = false
 
@@ -114,10 +122,28 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         }
 
         if (expression.isInlinableExtensionLambdaCall() && isEnabled) {
-            TODO()
+            val callSite = expression
+
+            return expression.extensionReceiver!!.apply {
+                transformChildren(object : IrElementTransformerVoid() {
+                    override fun visitReturn(expression: IrReturn): IrExpression {
+                        //TODO add returnSymbol check once the Inliner is fixed to return IrReturnableBlock instead of IrComposite
+                        val extensionReceiverArgument =
+                            expression.value.safeAs<IrFunctionExpression>() ?: return super.visitReturn(expression)
+
+                        return Inliner(
+                            callSite.apply { extensionReceiver = extensionReceiverArgument },
+                            callee,
+                            scope,
+                            parent,
+                            context
+                        ).inline()
+                    }
+                }, null)
+            }
         }
 
-        return if(callee.isInline && !callee.isExternal && isEnabled)
+        return if (callee.isInline && !callee.isExternal && isEnabled)
             inliner.inline()
         else
             expression
