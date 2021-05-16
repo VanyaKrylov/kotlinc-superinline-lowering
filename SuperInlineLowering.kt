@@ -51,6 +51,10 @@ fun IrFunctionAccessExpression.isInlinableExtensionLambdaCall(): Boolean {
             && extensionReceiverOrigin is SuperInlineLowering.SuperInlinedFunctionBodyOrigin
 }
 
+// TODO:
+// 1) Change from IrComposite to IrReturnableBlock and add returnSymbol checks
+// 2) Flatten IrComposite (or whatever Inliner returns)
+// 3) Add captured variables suppost in Inliner via isTopLevelCallSite checks
 class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass, IrElementTransformerVoidWithContext() {
     val superInlineAnnotationFqName: FqName = FqName("Script.SuperInline") //TODO change
     val superInlineAnnotationFqNameForCommandLine: FqName = FqName("SuperInline") //TODO change
@@ -62,7 +66,12 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
     override fun lower(irBody: IrBody, container: IrDeclaration) {
         containerScope = createScope(container as IrSymbolOwner)
         irBody.accept(this, null)
-        irBody.transform(InlinedIrCompositePostProcessingTransformer(containerScope!!), null)
+
+        if (inliningTriggered) {
+            irBody.transform(IrCompositeFlatteningTransformer(), null)
+            irBody.transform(InlinedIrCompositePostProcessingTransformer(containerScope!!), null)
+        }
+
         containerScope = null
         inliningTriggered = false
 
@@ -112,7 +121,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             return expression.dispatchReceiver!!.apply {
                 transformChildren(object : IrElementTransformerVoid() {
                     override fun visitReturn(expression: IrReturn): IrExpression {
-                        //TODO add returnSymbol check once the Inliner is fixed to return IrReturnableBlock instead of IrComposite
+                        if (expression.returnTargetSymbol != scope.scope.scopeOwnerSymbol)
+                            return super.visitReturn(expression)
+
                         val function = expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
 
                         return Inliner(callSite, function, scope, parent, context, true).inline()
@@ -127,7 +138,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             return expression.extensionReceiver!!.apply {
                 transformChildren(object : IrElementTransformerVoid() {
                     override fun visitReturn(expression: IrReturn): IrExpression {
-                        //TODO add returnSymbol check once the Inliner is fixed to return IrReturnableBlock instead of IrComposite
+                        if (expression.returnTargetSymbol != scope.scope.scopeOwnerSymbol)
+                            return super.visitReturn(expression)
+
                         val extensionReceiverArgument =
                             expression.value.safeAs<IrFunctionExpression>() ?: return super.visitReturn(expression)
 
@@ -606,6 +619,21 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             }
 
             return body
+        }
+    }
+
+    private inner class IrCompositeFlatteningTransformer : IrElementTransformerVoid() {
+        override fun visitComposite(expression: IrComposite): IrExpression {
+            expression.transformChildrenVoid()
+
+            expression.statements.transformFlat {
+                when(it) {
+                    is IrComposite -> it.statements
+                    else -> null
+                }
+            }
+
+            return expression
         }
     }
 
