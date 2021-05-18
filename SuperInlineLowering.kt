@@ -18,11 +18,13 @@ import org.jetbrains.kotlin.ir.expressions.impl.*
 import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.isNullable
+import org.jetbrains.kotlin.ir.types.isUnit
 import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
 import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
 import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
 import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.types.SimpleType
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
 
@@ -88,7 +90,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             expression !is IrCall ||
             callee is IrLazyFunction
         ) {
-
             return super.visitFunctionAccess(expression)
         }
 
@@ -142,7 +143,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                             return super.visitReturn(expression)
 
                         val extensionReceiverArgument =
-                            expression.value.safeAs<IrFunctionExpression>() ?: return super.visitReturn(expression)
+                            expression.value.safeAs<IrFunctionExpression>() ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
 
                         return Inliner(
                             callSite.apply { extensionReceiver = extensionReceiverArgument },
@@ -155,6 +156,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 }, null)
             }
         }
+
+        //todo IrComposite can be not only an extension receiver but a value parameter as well
 
         return if (callee.isInline && !callee.isExternal && isEnabled)
             inliner.inline()
@@ -548,26 +551,52 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
                     if (!isTopLevelStatement) {
                         val scopeWithIr = currentScope ?: containerScope
+
+                        if (expression.type.isUnit()) {
+                            expression.transformChildren(object : IrElementTransformerVoid() {
+                                override fun visitReturn(expression: IrReturn): IrExpression {
+                                    return if (expression.returnTargetSymbol == scopeWithIr.scope.scopeOwnerSymbol) //initializers for variables inside composite have the same returnTargetSymbol... :/
+                                        expression.value
+                                    else
+                                        expression
+                                }
+
+                                override fun visitComposite(expression: IrComposite): IrExpression {
+                                    return this@InlinedIrCompositePostProcessingTransformer.visitComposite(expression)
+                                }
+                            }, null)
+
+                            /*newStatements.apply {
+                                addAll(1, expression.statements)
+                            }*/
+
+                            return expression
+                        }
+
                         val tmpVar = scopeWithIr.scope.createTemporaryVariableDeclaration(expression.type, origin.calleeName)
 
                         expression.transformChildren(object : IrElementTransformerVoid() {
                             override fun visitReturn(expression: IrReturn): IrExpression {
-                                return if (expression.returnTargetSymbol == scopeWithIr.scope.scopeOwnerSymbol)
+                                return if (expression.returnTargetSymbol == scopeWithIr.scope.scopeOwnerSymbol) //initializers for variables inside composite have the same returnTargetSymbol... :/
                                     IrSetValueImpl(
                                         expression.startOffset,
                                         expression.endOffset,
-                                        expression.type,
+                                        expression.value.type,
                                         tmpVar.symbol,
                                         expression.value,
                                         null
                                     ) else
                                     expression
                             }
+/*
+                            override fun visitComposite(expression: IrComposite): IrExpression {
+                                return this@InlinedIrCompositePostProcessingTransformer.visitComposite(expression)
+                            }*/
                         }, null)
 
                         newStatements.apply {
-                            add(tmpVar)
-                            addAll(expression.statements)
+                            add(0, tmpVar)
+                            addAll(1, expression.statements)
                         }
 
                         return IrGetValueImpl(expression.startOffset, expression.endOffset, tmpVar.symbol, null)
@@ -627,13 +656,31 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             expression.transformChildrenVoid()
 
             expression.statements.transformFlat {
-                when(it) {
+                when (it) {
                     is IrComposite -> it.statements
+                    is IrReturn ->
+                        when (it.value.safeAs<IrComposite>()?.origin) {
+                            is SuperInlinedFunctionBodyOrigin -> it.value.safeAs<IrComposite>()!!.statements
+                            else -> null
+                        }
+
                     else -> null
                 }
             }
 
             return expression
+        }
+
+        override fun visitTypeOperator(expression: IrTypeOperatorCall): IrExpression {
+            when(val arg = expression.argument) {
+                is IrComposite -> {
+                    if (arg.origin is SuperInlinedFunctionBodyOrigin) {
+                        arg.type = expression.typeOperand
+                    }
+                }
+            }
+
+            return super.visitTypeOperator(expression)
         }
     }
 
