@@ -15,7 +15,9 @@ import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.declarations.lazy.IrLazyFunction
 import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.*
+import org.jetbrains.kotlin.ir.symbols.IrReturnTargetSymbol
 import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
+import org.jetbrains.kotlin.ir.symbols.impl.IrReturnableBlockSymbolImpl
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.isNullable
 import org.jetbrains.kotlin.ir.types.isUnit
@@ -24,9 +26,12 @@ import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
 import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
 import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
 import org.jetbrains.kotlin.name.FqName
-import org.jetbrains.kotlin.types.SimpleType
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
+import kotlin.math.exp
+
+fun IrReturn.withReturnTargetSymbol(returnTargetSymbol: IrReturnTargetSymbol) =
+    IrReturnImpl(startOffset, endOffset, type, returnTargetSymbol, value)
 
 fun IrValueParameter.isSuperInlineParameter(type: IrType = this.type) =
     !isNoinline && !type.isNullable() && (type.isFunction() || type.isSuspendFunction())
@@ -34,7 +39,7 @@ fun IrValueParameter.isSuperInlineParameter(type: IrType = this.type) =
 fun IrFunctionAccessExpression.isInlinableLambdaInvokeCall(): Boolean {
     val callee = this.symbol.owner
     val dispatchReceiverParameter = callee.dispatchReceiverParameter ?: return false
-    val dispatchReceiverOrigin = this.dispatchReceiver.safeAs<IrComposite>()?.origin ?: return false
+    val dispatchReceiverOrigin = this.dispatchReceiver.safeAs<IrReturnableBlock>()?.origin ?: return false
 
     return this is IrCall
             && callee.name == OperatorNameConventions.INVOKE
@@ -45,7 +50,7 @@ fun IrFunctionAccessExpression.isInlinableLambdaInvokeCall(): Boolean {
 fun IrFunctionAccessExpression.isInlinableExtensionLambdaCall(): Boolean {
     val callee = this.symbol.owner
     val extensionReceiverParameter = callee.extensionReceiverParameter ?: return false
-    val extensionReceiverOrigin = this.extensionReceiver.safeAs<IrComposite>()?.origin ?: return false
+    val extensionReceiverOrigin = this.extensionReceiver.safeAs<IrReturnableBlock>()?.origin ?: return false
 
     return this is IrCall
             && callee.isInline
@@ -115,14 +120,62 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             return inlined
         }
 
+        when (val dispatchReceiver = expression.dispatchReceiver) {
+            is IrReturnableBlock -> if (expression.isInlinableLambdaInvokeCall() && isEnabled) {
+                val callSite = expression
+
+                return dispatchReceiver.apply {
+                    transformChildren(object : IrElementTransformerVoid() {
+                        override fun visitReturn(expression: IrReturn): IrExpression {
+                            if (expression.returnTargetSymbol != dispatchReceiver.symbol)
+                                return super.visitReturn(expression)
+
+                            val function = expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
+
+                            return Inliner(callSite, function, scope, parent, context, true).inline()
+                        }
+                    }, null)
+                    flattenAndPatchReturnTargetSymbol()
+                }
+            }
+        }
+
+        when (val extensionReceiver = expression.extensionReceiver) {
+            is IrReturnableBlock -> if (expression.isInlinableExtensionLambdaCall() && isEnabled) {
+                val callSite = expression
+
+                return extensionReceiver.apply {
+                    transformChildren(object : IrElementTransformerVoid() {
+                        override fun visitReturn(expression: IrReturn): IrExpression {
+                            if (expression.returnTargetSymbol != extensionReceiver.symbol)
+                                return super.visitReturn(expression)
+
+                            val extensionReceiverArgument =
+                                expression.value.safeAs<IrFunctionExpression>()
+                                    ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
+
+                            return Inliner(
+                                callSite.apply { this.extensionReceiver = extensionReceiverArgument },
+                                callee,
+                                scope,
+                                parent,
+                                context
+                            ).inline()
+                        }
+                    }, null)
+                    flattenAndPatchReturnTargetSymbol()
+                }
+            }
+        }
+
         //Assuming that only cases with isEnabled=true reach this code
-        if (expression.isInlinableLambdaInvokeCall() && isEnabled) {
+        /*if (expression.isInlinableLambdaInvokeCall() && isEnabled) {
             val callSite = expression
 
-            return expression.dispatchReceiver!!.apply {
+            return (expression.dispatchReceiver as IrReturnableBlock).apply { //dispatchReceiver is checked in
                 transformChildren(object : IrElementTransformerVoid() {
                     override fun visitReturn(expression: IrReturn): IrExpression {
-                        if (expression.returnTargetSymbol != scope.scope.scopeOwnerSymbol)
+                        if (expression.returnTargetSymbol != (callSite.dispatchReceiver as IrReturnableBlock).symbol)
                             return super.visitReturn(expression)
 
                         val function = expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
@@ -130,20 +183,22 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                         return Inliner(callSite, function, scope, parent, context, true).inline()
                     }
                 }, null)
+                flattenAndPatchReturnTargetSymbol()
             }
-        }
+        }*/
 
-        if (expression.isInlinableExtensionLambdaCall() && isEnabled) {
+        /*if (expression.isInlinableExtensionLambdaCall() && isEnabled) {
             val callSite = expression
 
-            return expression.extensionReceiver!!.apply {
+            return (expression.extensionReceiver as IrReturnableBlock).apply { //extensionReceiver value is checked in isInlinableExtensionLambdaCall() thus the cast is safe
                 transformChildren(object : IrElementTransformerVoid() {
                     override fun visitReturn(expression: IrReturn): IrExpression {
-                        if (expression.returnTargetSymbol != scope.scope.scopeOwnerSymbol)
+                        if (expression.returnTargetSymbol != (callSite.extensionReceiver as IrReturnableBlock).symbol)
                             return super.visitReturn(expression)
 
                         val extensionReceiverArgument =
-                            expression.value.safeAs<IrFunctionExpression>() ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
+                            expression.value.safeAs<IrFunctionExpression>()
+                                ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
 
                         return Inliner(
                             callSite.apply { extensionReceiver = extensionReceiverArgument },
@@ -154,8 +209,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                         ).inline()
                     }
                 }, null)
+                flattenAndPatchReturnTargetSymbol()
             }
-        }
+        }*/
 
         //todo IrComposite can be not only an extension receiver but a value parameter as well
 
@@ -163,7 +219,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             inliner.inline()
         else
             expression
-
     }
 
     private inner class Inliner(
@@ -192,78 +247,42 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         fun inline() = inlineFunction(callSite, callee, false)
 
-        /**
-         * TODO: JVM inliner crashed on attempt inline this function from transform.kt with:
-         *  j.l.IllegalStateException: Couldn't obtain compiled function body for
-         *  public inline fun <reified T : org.jetbrains.kotlin.ir.IrElement> kotlin.collections.MutableList<T>.transform...
-         */
-        private inline fun <reified T : IrElement> MutableList<T>.transform(transformation: (T) -> IrElement) {
-            forEachIndexed { i, item ->
-                set(i, transformation(item) as T)
-            }
-        }
-
         private fun inlineFunction(
             callSite: IrFunctionAccessExpression,
             callee: IrFunction,
             performRecursiveInline: Boolean
-        ): IrComposite {
+        ): IrReturnableBlock {
             val copiedCallee = (copyIrElement.copy(callee) as IrFunction).apply {
                 parent = callee.parent
             }
 
             val evaluationStatements = evaluateArguments(callSite, copiedCallee)
             val statements = (copiedCallee.body as IrBlockBody).statements
-
-            val scopeSymbol = currentScope.scope.scopeOwnerSymbol
-            val irBuilder = context.createIrBuilder(scopeSymbol)
-
-            /*val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl()
+            val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl()
             val endOffset = callee.endOffset
-            *//* creates irBuilder appending to the end of the given returnable block: thus why we initialize
-             * irBuilder with (..., endOffset, endOffset).
-             *//*
-            val irBuilder = context.createIrBuilder(irReturnableBlockSymbol, endOffset, endOffset)*/
-
+            val irBuilder = context.createIrBuilder(irReturnableBlockSymbol, endOffset, endOffset)
             val transformer = ParameterSubstitutor()
+
             statements.transform { it.transform(transformer, data = null) }
+
             // Process chained invoke calls. It's needed to be done after the ParameterSubstitutor, because we need to have
             // all the lambdas passed as parameter to be already inlined
             // Example:
             // lambdaParam.invoke().invoke() ==> (after ParameterSubstitutor) IrComposite( ... IrReturn(IrFuncExpr) ... ).invoke() ==> IrComposite( ... IrReturn ... )
-
             statements.transform { it.transform(this@SuperInlineLowering, null) } //TODO uncomment
 
             statements.addAll(0, evaluationStatements)
 
-            return IrCompositeImpl( //TODO revert back to IrReturnableBlock due to semantics (the post-processing logic should also be reimplemented for this change)
-                callSite.startOffset,
-                callSite.endOffset,
-                callSite.type,
-                SuperInlinedFunctionBodyOrigin(callee.symbol.owner.name.toString()),
-                statements
-            ).apply {
-                transformChildrenVoid(object : IrElementTransformerVoid() {
-                    override fun visitReturn(expression: IrReturn): IrExpression {
-                        expression.transformChildrenVoid(this)
-
-                        if (expression.returnTargetSymbol == copiedCallee.symbol) // return target is lifted to scopeOwner because the function is inlined
-                            return irBuilder.irReturn(expression.value)
-                        return expression
-                    }
-                })
-                patchDeclarationParents(parent)
-            }
-
-            /*return IrReturnableBlockImpl(
+            return IrReturnableBlockImpl(
                 startOffset = callSite.startOffset,
                 endOffset = callSite.endOffset,
                 type = callSite.type,
                 symbol = irReturnableBlockSymbol,
-                origin = null,
+                origin = SuperInlinedFunctionBodyOrigin(callee.symbol.owner.name.toString()),
                 statements = statements,
                 inlineFunctionSymbol = callee.symbol
             ).apply {
+                flattenAndPatchReturnTargetSymbol()
                 transformChildrenVoid(object : IrElementTransformerVoid() {
                     override fun visitReturn(expression: IrReturn): IrExpression {
                         expression.transformChildrenVoid(this)
@@ -274,7 +293,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     }
                 })
                 patchDeclarationParents(parent) // TODO: Why it is not enough to just run SetDeclarationsParentVisitor?
-            }*/
+            }
         }
 
         //---------------------------------------------------------------------//
@@ -652,7 +671,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
     }
 
     private inner class IrCompositeFlatteningTransformer : IrElementTransformerVoid() {
-        override fun visitComposite(expression: IrComposite): IrExpression {
+        /*override fun visitComposite(expression: IrComposite): IrExpression {
             expression.transformChildrenVoid()
 
             expression.statements.transformFlat {
@@ -669,10 +688,52 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             }
 
             return expression
+        }*/
+
+        override fun visitBlock(expression: IrBlock): IrExpression {
+            return when (expression) {
+                is IrReturnableBlock -> {
+                    expression.transformChildrenVoid()
+
+                    val parentBlock = expression
+                    expression.statements.transformFlat {
+                        when (val parentStatement = it) {
+                            is IrReturnableBlock -> parentStatement.statements.apply {
+                                transformInPlace {
+                                    it.transform(object : IrElementTransformerVoid() {
+                                        override fun visitReturn(expression: IrReturn): IrExpression {
+                                            return if (expression.returnTargetSymbol == parentStatement.symbol)
+                                                IrReturnImpl(
+                                                    expression.startOffset,
+                                                    expression.endOffset,
+                                                    expression.type,
+                                                    parentBlock.symbol,
+                                                    expression.value
+                                                )
+                                            else
+                                                expression
+                                        }
+                                    }, null)
+                                }
+                            }
+
+                            is IrReturn -> when (parentStatement.value.safeAs<IrReturnableBlock>()?.origin) {
+                                is SuperInlinedFunctionBodyOrigin -> parentStatement.value.safeAs<IrReturnableBlock>()!!.statements
+                                else -> null
+                            }
+
+                            else -> null
+                        }
+                    }
+
+                    return expression
+                }
+                else -> super.visitBlock(expression)
+            }
         }
 
         override fun visitTypeOperator(expression: IrTypeOperatorCall): IrExpression {
-            when(val arg = expression.argument) {
+            when (val arg = expression.argument) {
                 is IrComposite -> {
                     if (arg.origin is SuperInlinedFunctionBodyOrigin) {
                         arg.type = expression.typeOperand
@@ -681,6 +742,58 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             }
 
             return super.visitTypeOperator(expression)
+        }
+    }
+
+    private fun IrReturnableBlock.flattenAndPatchReturnTargetSymbol() = apply {
+        fun IrStatement.patchReturnTargetSymbols(
+            innerReturnableBlockSymbol: IrReturnTargetSymbol,
+            irReturnableBlockSymbol: IrReturnTargetSymbol
+        ) = transform(object : IrElementTransformerVoid() {
+
+            override fun visitReturn(expression: IrReturn): IrExpression {
+                return if (expression.returnTargetSymbol == innerReturnableBlockSymbol)
+                    expression.withReturnTargetSymbol(irReturnableBlockSymbol)
+                else
+                    super.visitReturn(expression)
+            }
+
+        }, null)
+
+        fun IrReturnableBlock.flattenAndPatchWithReturnTargetSymbol() =
+            if (origin is SuperInlinedFunctionBodyOrigin) {
+                val innerReturnableBlockSymbol = symbol
+
+                statements.apply {
+                    transform {
+                        it.patchReturnTargetSymbols(innerReturnableBlockSymbol, symbol)
+                    }
+                }
+            } else {
+                null
+            }
+
+        statements.transformFlat {
+            when (it) {
+                is IrReturnableBlock -> it.flattenAndPatchWithReturnTargetSymbol()
+                is IrReturn -> when (val v = it.value) {
+                    is IrReturnableBlock -> return@transformFlat v.flattenAndPatchWithReturnTargetSymbol()
+                    else -> return@transformFlat null
+                }
+
+                else -> null
+            }
+        }
+    }
+
+    /**
+     * TODO: JVM inliner crashed on attempt inline this function from transform.kt with:
+     *  j.l.IllegalStateException: Couldn't obtain compiled function body for
+     *  public inline fun <reified T : org.jetbrains.kotlin.ir.IrElement> kotlin.collections.MutableList<T>.transform...
+     */
+    private inline fun <reified T : IrElement> MutableList<T>.transform(transformation: (T) -> IrElement) {
+        forEachIndexed { i, item ->
+            set(i, transformation(item) as T)
         }
     }
 
