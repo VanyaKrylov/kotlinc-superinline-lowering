@@ -106,9 +106,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             ?: allScopes.map { it.irElement }.filterIsInstance<IrDeclaration>().lastOrNull()?.parent
             ?: containerScope?.irElement as? IrDeclarationParent
             ?: (containerScope?.irElement as? IrDeclaration)?.parent
-
         val scope = currentScope ?: containerScope!!
-
         val inliner = Inliner(expression, callee, scope, parent, context)
 
         if (callee.hasAnnotation(superInlineAnnotationFqName) ||
@@ -168,52 +166,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             }
         }
 
-        //Assuming that only cases with isEnabled=true reach this code
-        /*if (expression.isInlinableLambdaInvokeCall() && isEnabled) {
-            val callSite = expression
-
-            return (expression.dispatchReceiver as IrReturnableBlock).apply { //dispatchReceiver is checked in
-                transformChildren(object : IrElementTransformerVoid() {
-                    override fun visitReturn(expression: IrReturn): IrExpression {
-                        if (expression.returnTargetSymbol != (callSite.dispatchReceiver as IrReturnableBlock).symbol)
-                            return super.visitReturn(expression)
-
-                        val function = expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
-
-                        return Inliner(callSite, function, scope, parent, context, true).inline()
-                    }
-                }, null)
-                flattenAndPatchReturnTargetSymbol()
-            }
-        }*/
-
-        /*if (expression.isInlinableExtensionLambdaCall() && isEnabled) {
-            val callSite = expression
-
-            return (expression.extensionReceiver as IrReturnableBlock).apply { //extensionReceiver value is checked in isInlinableExtensionLambdaCall() thus the cast is safe
-                transformChildren(object : IrElementTransformerVoid() {
-                    override fun visitReturn(expression: IrReturn): IrExpression {
-                        if (expression.returnTargetSymbol != (callSite.extensionReceiver as IrReturnableBlock).symbol)
-                            return super.visitReturn(expression)
-
-                        val extensionReceiverArgument =
-                            expression.value.safeAs<IrFunctionExpression>()
-                                ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
-
-                        return Inliner(
-                            callSite.apply { extensionReceiver = extensionReceiverArgument },
-                            callee,
-                            scope,
-                            parent,
-                            context
-                        ).inline()
-                    }
-                }, null)
-                flattenAndPatchReturnTargetSymbol()
-            }
-        }*/
-
-        //todo IrComposite can be not only an extension receiver but a value parameter as well
+        //todo IrReturnableBlock can be not only an extension receiver but a value parameter as well
 
         return if (callee.isInline && !callee.isExternal && isEnabled)
             inliner.inline()
@@ -268,7 +221,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             // Process chained invoke calls. It's needed to be done after the ParameterSubstitutor, because we need to have
             // all the lambdas passed as parameter to be already inlined
             // Example:
-            // lambdaParam.invoke().invoke() ==> (after ParameterSubstitutor) IrComposite( ... IrReturn(IrFuncExpr) ... ).invoke() ==> IrComposite( ... IrReturn ... )
+            // lambdaParam.invoke().invoke() ==> (after ParameterSubstitutor) IrReturnableBlock( ... IrReturn(IrFuncExpr) ... ).invoke() ==> IrReturnableBlock( ... IrReturn ... )
             statements.transform { it.transform(this@SuperInlineLowering, null) } //TODO uncomment
 
             statements.addAll(0, evaluationStatements)
@@ -766,7 +719,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
                 statements.apply {
                     transform {
-                        it.patchReturnTargetSymbols(innerReturnableBlockSymbol, symbol)
+                        it.patchReturnTargetSymbols(innerReturnableBlockSymbol, this@flattenAndPatchReturnTargetSymbol.symbol)
                     }
                 }
             } else {
