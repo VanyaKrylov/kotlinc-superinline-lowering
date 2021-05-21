@@ -108,7 +108,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val inliner = Inliner(expression, callee, scope, parent, context)
 
         if (callee.hasAnnotation(superInlineAnnotationFqName) ||
-            callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine)
+            callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine) //TODO handle inlined arguments (FIX!)
         ) {
             val inlined = inliner.inline()
             isInliningEnabled = false
@@ -172,7 +172,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 }
             }
         }
-        //todo IrReturnableBlock can be not only an extension receiver but a value parameter as well
 
         return if (callee.needsInlining && isInliningEnabled)
             inliner.inline()
@@ -271,13 +270,75 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             //-----------------------------------------------------------------//
 
             override fun visitCall(expression: IrCall): IrExpression {
+                expression.transformChildrenVoid()
+
+                //todo cover cases when IrRetBlock is just a valueArgument
+
+                when (val dispatchReceiver = expression.dispatchReceiver) {
+                    is IrReturnableBlock -> if (expression.isInlinableLambdaInvokeCall()) {
+                        val callSite = expression
+
+                        return dispatchReceiver.apply {
+                            transformChildren(object : IrElementTransformerVoid() {
+                                override fun visitReturn(expression: IrReturn): IrExpression {
+                                    if (expression.returnTargetSymbol != dispatchReceiver.symbol)
+                                        return super.visitReturn(expression)
+
+                                    val function =
+                                        expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
+
+                                    return inlineFunction(
+                                        callSite.apply { transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() } },
+                                        function,
+                                        false
+                                    )
+                                }
+                            }, null)
+                            flattenAndPatchReturnTargetSymbol()
+                        }
+                    }
+                }
+
+                when (val callSiteExtensionReceiver = expression.extensionReceiver) {
+                    is IrReturnableBlock -> if (expression.isInlinableExtensionLambdaCall()) {
+                        val callSite = expression
+
+                        return callSiteExtensionReceiver.apply {
+                            transformChildren(object : IrElementTransformerVoid() {
+                                override fun visitReturn(expression: IrReturn): IrExpression {
+                                    if (expression.returnTargetSymbol != callSiteExtensionReceiver.symbol)
+                                        return super.visitReturn(expression)
+
+                                    val extensionReceiverArgument = expression.value.safeAs<IrFunctionExpression>()
+                                        ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
+
+                                    return inlineFunction(
+                                        callSite.apply {
+                                            extensionReceiver = extensionReceiverArgument
+                                            transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() }
+                                        },
+                                        callSite.symbol.owner,
+                                        false
+                                    )
+                                }
+                            }, null)
+                            flattenAndPatchReturnTargetSymbol()
+                        }
+                    }
+                }
+
                 if (!isLambdaCall(expression))
                     return super.visitCall(expression)
 
-                val dispatchReceiver = expression.dispatchReceiver as IrGetValue
-                val functionArgument = substituteMap[dispatchReceiver.symbol.owner] ?: return super.visitCall(expression)
-                if ((dispatchReceiver.symbol.owner as? IrValueParameter)?.isNoinline == true)
-                    return super.visitCall(expression)
+                val functionArgument = when (val value = expression.dispatchReceiver) {
+                    is IrGetValue ->
+                        if ((value.symbol.owner as? IrValueParameter)?.isNoinline == true)
+                            return super.visitCall(expression)
+                        else
+                            substituteMap[value.symbol.owner] ?: return super.visitCall(expression)
+                    is IrFunctionExpression -> value
+                    else -> TODO("Should be either IrGetValue or IrFunctionExpression")
+                }
 
                 if (functionArgument !is IrFunctionExpression)
                     return super.visitCall(expression)
@@ -313,7 +374,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             return (dispatchReceiver.type.isFunction() || dispatchReceiver.type.isSuspendFunction())
                     && callee.name == OperatorNameConventions.INVOKE
-                    && irCall.dispatchReceiver is IrGetValue
+                    && (irCall.dispatchReceiver is IrGetValue || irCall.dispatchReceiver is IrFunctionExpression)
         }
 
         //-------------------------------------------------------------------------//
@@ -643,15 +704,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             putValueArgument(i, transformation(arg))
         }
     }
-
-    private val IrFunctionAccessExpression.valueArguments
-        get() =
-            mutableListOf<IrExpression>().apply {
-                for (i in symbol.owner.valueParameters.indices) {
-                    val arg = getValueArgument(i) ?: continue
-                    add(arg)
-                }
-            }
 
     private class IrGetValueWithoutLocation(
         override val symbol: IrValueSymbol,
