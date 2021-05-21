@@ -270,7 +270,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             //-----------------------------------------------------------------//
 
             override fun visitCall(expression: IrCall): IrExpression {
-                expression.transformChildrenVoid()
+                expression.transformChildrenVoid() //same as in SuperInlineLowering (transformer) - we are walking the IR tree depth-first
 
                 //todo cover cases when IrRetBlock is just a valueArgument
 
@@ -345,7 +345,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
                 // Inline the lambda. Lambda parameters will be substituted with lambda arguments.
                 val newExpression = inlineFunction(
-                    expression,
+                    expression.apply { transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() } },
                     functionArgument.function,
                     false
                 )
