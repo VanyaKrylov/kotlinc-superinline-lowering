@@ -24,6 +24,7 @@ import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.isNullable
 import org.jetbrains.kotlin.ir.types.isUnit
 import org.jetbrains.kotlin.ir.util.*
+import org.jetbrains.kotlin.ir.visitors.IrElementTransformer
 import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
 import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
 import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
@@ -118,26 +119,10 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         when (val dispatchReceiver = expression.dispatchReceiver) {
             is IrReturnableBlock -> if (expression.isInlinableLambdaInvokeCall() && isInliningEnabled) {
-                val callSite = expression
+                val dispatchTransformer = inliner.dispatchReceiverInliningTransformer
 
                 return dispatchReceiver.apply {
-                    transformChildren(object : IrElementTransformerVoid() {
-                        override fun visitReturn(expression: IrReturn): IrExpression {
-                            if (expression.returnTargetSymbol != dispatchReceiver.symbol)
-                                return super.visitReturn(expression)
-
-                            val function = expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
-
-                            return Inliner(
-                                callSite.apply { transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() } },
-                                function,
-                                scope,
-                                parent,
-                                context,
-                                true
-                            ).inline()
-                        }
-                    }, null)
+                    transformChildren(dispatchTransformer, dispatchReceiver to expression)
                     flattenAndPatchReturnTargetSymbol()
                 }
             }
@@ -145,36 +130,17 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         when (val callSiteExtensionReceiver = expression.extensionReceiver) {
             is IrReturnableBlock -> if (expression.isInlinableExtensionLambdaCall() && isInliningEnabled) {
-                val callSite = expression
+                val extensionTransformer = inliner.extensionReceiverInliningTransformer
 
                 return callSiteExtensionReceiver.apply {
-                    transformChildren(object : IrElementTransformerVoid() {
-                        override fun visitReturn(expression: IrReturn): IrExpression {
-                            if (expression.returnTargetSymbol != callSiteExtensionReceiver.symbol)
-                                return super.visitReturn(expression)
-
-                            val extensionReceiverArgument = expression.value.safeAs<IrFunctionExpression>()
-                                ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
-
-                            return Inliner(
-                                callSite.apply {
-                                    extensionReceiver = extensionReceiverArgument
-                                    transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() }
-                                },
-                                callee,
-                                scope,
-                                parent,
-                                context
-                            ).inline()
-                        }
-                    }, null)
+                    transformChildren(extensionTransformer, callSiteExtensionReceiver to expression)
                     flattenAndPatchReturnTargetSymbol()
                 }
             }
         }
 
         return if (callee.needsInlining && isInliningEnabled)
-            inliner.inline()
+            inliner.inline().destructureRetunableBlockIfSingleReturnStatement()
         else
             expression
     }
@@ -188,6 +154,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val ignoreDispatchReceiver: Boolean = false,
         val isTopLevelCallSite: Boolean = false
     ) {
+
+        val extensionReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = true)
+        val dispatchReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = false)
 
         val copyIrElement = run {
             val typeParameters =
@@ -254,7 +223,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         //---------------------------------------------------------------------//
 
-        private inner class ParameterSubstitutor : IrElementTransformerVoid() {
+        private inner class ParameterSubstitutor : IrElementTransformerVoidWithContext() { //todo changed to ..withContext
 
             override fun visitGetValue(expression: IrGetValue): IrExpression {
                 val newExpression = super.visitGetValue(expression) as IrGetValue
@@ -275,56 +244,32 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 //todo cover cases when IrRetBlock is just a valueArgument
 
                 when (val dispatchReceiver = expression.dispatchReceiver) {
-                    is IrReturnableBlock -> if (expression.isInlinableLambdaInvokeCall()) {
-                        val callSite = expression
+                    is IrReturnableBlock ->
+                        if (expression.isInlinableLambdaInvokeCall()) {
 
-                        return dispatchReceiver.apply {
-                            transformChildren(object : IrElementTransformerVoid() {
-                                override fun visitReturn(expression: IrReturn): IrExpression {
-                                    if (expression.returnTargetSymbol != dispatchReceiver.symbol)
-                                        return super.visitReturn(expression)
-
-                                    val function =
-                                        expression.value.safeAs<IrFunctionExpression>()?.function ?: return super.visitReturn(expression)
-
-                                    return inlineFunction(
-                                        callSite.apply { transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() } },
-                                        function,
-                                        false
-                                    )
-                                }
-                            }, null)
-                            flattenAndPatchReturnTargetSymbol()
+                            return dispatchReceiver.apply {
+                                transformChildren(dispatchReceiverInliningTransformer, this to expression)
+                                flattenAndPatchReturnTargetSymbol()
+                            }
                         }
-                    }
                 }
 
                 when (val callSiteExtensionReceiver = expression.extensionReceiver) {
-                    is IrReturnableBlock -> if (expression.isInlinableExtensionLambdaCall()) {
-                        val callSite = expression
+                    is IrReturnableBlock ->
+                        if (expression.isInlinableExtensionLambdaCall()) {
+                            val transformer = Inliner(
+                                expression,
+                                expression.symbol.owner,
+                                this@ParameterSubstitutor.currentScope ?: this@Inliner.currentScope,
+                                parent,
+                                context
+                            ).extensionReceiverInliningTransformer
 
-                        return callSiteExtensionReceiver.apply {
-                            transformChildren(object : IrElementTransformerVoid() {
-                                override fun visitReturn(expression: IrReturn): IrExpression {
-                                    if (expression.returnTargetSymbol != callSiteExtensionReceiver.symbol)
-                                        return super.visitReturn(expression)
-
-                                    val extensionReceiverArgument = expression.value.safeAs<IrFunctionExpression>()
-                                        ?: return super.visitReturn(expression) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
-
-                                    return inlineFunction(
-                                        callSite.apply {
-                                            extensionReceiver = extensionReceiverArgument
-                                            transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() }
-                                        },
-                                        callSite.symbol.owner,
-                                        false
-                                    )
-                                }
-                            }, null)
-                            flattenAndPatchReturnTargetSymbol()
+                            return callSiteExtensionReceiver.apply {
+                                transformChildren(transformer, this to expression)
+                                flattenAndPatchReturnTargetSymbol()
+                            }
                         }
-                    }
                 }
 
                 if (!isLambdaCall(expression))
@@ -345,10 +290,11 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
                 // Inline the lambda. Lambda parameters will be substituted with lambda arguments.
                 val newExpression = inlineFunction(
-                    expression.apply { transformValueArguments { it.getReturnStmtValueIfIsSingleStmtInReturnableBlock() } },
+                    expression.apply { transformValueArguments { it.destructureRetunableBlockIfSingleReturnStatement() } },
                     functionArgument.function,
                     false
-                )
+                ).destructureRetunableBlockIfSingleReturnStatement()
+
                 // Substitute lambda arguments with target function arguments.
                 return newExpression.transform(
                     this,
@@ -508,6 +454,38 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 substituteMap[argument.parameter] = IrGetValueWithoutLocation(newVariable.symbol)
             }
             return evaluationStatements
+        }
+
+        private inner class ReceiverInliningTransformer(val isExtension: Boolean) :
+            IrElementTransformer<Pair<IrReturnableBlock, IrCall>> {
+            override fun visitReturn(expression: IrReturn, data: Pair<IrReturnableBlock, IrCall>): IrExpression {
+                val callSiteExtensionReceiver = data.first
+                if (expression.returnTargetSymbol != callSiteExtensionReceiver.symbol)
+                    return super.visitReturn(expression, data)
+
+                val receiverArgument = expression.value.safeAs<IrFunctionExpression>()
+                    ?: return super.visitReturn(
+                        expression,
+                        data
+                    ) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
+
+                val callSite = data.second.apply { transformValueArguments { it.destructureRetunableBlockIfSingleReturnStatement() } }
+
+                return (
+                        if (isExtension)
+                            inlineFunction(
+                                callSite.apply {
+                                    extensionReceiver = receiverArgument
+                                    transformValueArguments { it.destructureRetunableBlockIfSingleReturnStatement() }
+                                },
+                                callSite.symbol.owner,
+                                false
+                            ) else
+                            inlineFunction(callSite, receiverArgument.function, false)
+                        )
+                    .destructureRetunableBlockIfSingleReturnStatement()
+
+            }
         }
     }
 
@@ -688,7 +666,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
     private fun IrReturnableBlock.isSingleReturnStatement() =
         statements.size == 1 && statements.last() is IrReturn
 
-    private fun IrExpression.getReturnStmtValueIfIsSingleStmtInReturnableBlock() =
+    private fun IrExpression.destructureRetunableBlockIfSingleReturnStatement() =
         when (this) {
             is IrReturnableBlock ->
                 if (isSingleReturnStatement())
