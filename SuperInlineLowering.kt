@@ -12,6 +12,7 @@ import org.jetbrains.kotlin.backend.common.lower.createIrBuilder
 import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.IrStatement
 import org.jetbrains.kotlin.ir.UNDEFINED_OFFSET
+import org.jetbrains.kotlin.ir.builders.irComposite
 import org.jetbrains.kotlin.ir.builders.irReturn
 import org.jetbrains.kotlin.ir.declarations.*
 import org.jetbrains.kotlin.ir.declarations.lazy.IrLazyFunction
@@ -61,21 +62,28 @@ fun IrFunctionAccessExpression.isInlinableExtensionLambdaCall(): Boolean {
 }
 
 // TODO:
-// 1) Add captured variables suppost in Inliner via isTopLevelCallSite checks
+// 1) Add captured variables support in Inliner via isTopLevelCallSite checks
 class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass, IrElementTransformerVoidWithContext() {
-    val superInlineAnnotationFqName: FqName = FqName("Script.SuperInline") //TODO change
-    val superInlineAnnotationFqNameForCommandLine: FqName = FqName("SuperInline") //TODO change
+    private val superInlineAnnotationFqName: FqName = FqName("Script.SuperInline")
+    private val superInlineAnnotationFqNameForCommandLine: FqName = FqName("SuperInline")
     private val IrFunction.needsInlining get() = this.isInline && !this.isExternal
     private var containerScope: ScopeWithIr? = null
     private var isInliningEnabled: Boolean = false
     private var inliningTriggered: Boolean = false
+
+    private val postProcessingEvaluationStatements = mutableListOf<IrStatement>()
 
     override fun lower(irBody: IrBody, container: IrDeclaration) {
         containerScope = createScope(container as IrSymbolOwner)
         irBody.accept(this, null)
 
         if (inliningTriggered) {
-            irBody.transform(InlinedIrCompositePostProcessingTransformer(containerScope!!), null)
+            irBody.transform(InliningPostProcessingTransformer(containerScope!!), null)
+
+            when(irBody) {
+                is IrBlockBody -> irBody.statements.addAll(0, postProcessingEvaluationStatements)
+                else -> TODO("Not supported yet")
+            }
         }
 
         containerScope = null
@@ -99,12 +107,14 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         isInliningEnabled = true
         inliningTriggered = true
+
         expression.transformChildrenVoid()
 
         val parent = allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
             ?: allScopes.map { it.irElement }.filterIsInstance<IrDeclaration>().lastOrNull()?.parent
             ?: containerScope?.irElement as? IrDeclarationParent
             ?: (containerScope?.irElement as? IrDeclaration)?.parent
+
         val scope = currentScope ?: containerScope!!
         val inliner = Inliner(expression, callee, scope, parent, context)
 
@@ -207,6 +217,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 inlineFunctionSymbol = callee.symbol
             ).apply {
                 flattenAndPatchReturnTargetSymbol()
+
                 transformChildrenVoid(object : IrElementTransformerVoid() {
                     override fun visitReturn(expression: IrReturn): IrExpression {
                         expression.transformChildrenVoid(this)
@@ -217,6 +228,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                         return expression
                     }
                 })
+
                 patchDeclarationParents(parent)
             }
         }
@@ -272,6 +284,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                         }
                 }
 
+//                TODO: add case for basic inline functions
+
                 if (!isLambdaCall(expression))
                     return super.visitCall(expression)
 
@@ -320,7 +334,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             return (dispatchReceiver.type.isFunction() || dispatchReceiver.type.isSuspendFunction())
                     && callee.name == OperatorNameConventions.INVOKE
-                    && (irCall.dispatchReceiver is IrGetValue || irCall.dispatchReceiver is IrFunctionExpression)
+                    && (irCall.dispatchReceiver is IrGetValue
+                    || irCall.dispatchReceiver is IrFunctionExpression) //case when the lambda argument was already substituted
         }
 
         //-------------------------------------------------------------------------//
@@ -456,8 +471,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             return evaluationStatements
         }
 
-        private inner class ReceiverInliningTransformer(val isExtension: Boolean) :
-            IrElementTransformer<Pair<IrReturnableBlock, IrCall>> {
+        private inner class ReceiverInliningTransformer(val isExtension: Boolean) : IrElementTransformer<Pair<IrReturnableBlock, IrCall>> {
+
             override fun visitReturn(expression: IrReturn, data: Pair<IrReturnableBlock, IrCall>): IrExpression {
                 val callSiteExtensionReceiver = data.first
                 if (expression.returnTargetSymbol != callSiteExtensionReceiver.symbol)
@@ -486,6 +501,49 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     .destructureRetunableBlockIfSingleReturnStatement()
 
             }
+        }
+    }
+
+    private inner class InliningPostProcessingTransformer(val containerScope: ScopeWithIr) : IrElementTransformerVoid() {
+
+        override fun visitVariable(declaration: IrVariable): IrStatement {
+            declaration.transformChildrenVoid()
+
+            if (declaration.initializer.isInlinedBlock()) {
+                val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(declaration.type, declaration.name.toString())
+                val initializer = declaration.initializer as IrReturnableBlock
+
+                initializer.transformChildren(object : IrElementTransformerVoid() {
+                    override fun visitReturn(expression: IrReturn): IrExpression {
+//                        expression.transformChildrenVoid() //theoretically we shouldn't face situations with nested returns with same returnSymbol
+                        return if (expression.returnTargetSymbol == initializer.symbol)
+                            IrSetValueImpl(
+                                expression.startOffset,
+                                expression.endOffset,
+                                expression.value.type,
+                                tmpVar.symbol,
+                                expression.value,
+                                null
+                            )
+                        else
+                            expression
+                    }
+                }, null)
+
+                postProcessingEvaluationStatements.add(0, tmpVar)
+//                postProcessingEvaluationStatements.addAll(1, initializer.statements)
+
+                declaration.initializer = IrGetValueImpl(initializer.startOffset, initializer.endOffset, tmpVar.symbol, null)
+
+                val irBuilder = context.createIrBuilder(declaration.symbol, declaration.startOffset, declaration.endOffset)
+
+                return irBuilder.irComposite(origin = SuperInlinedFunctionBodyOrigin("")) {
+                    initializer.statements.forEach { +it }
+                    +declaration
+                }
+            }
+
+            return declaration
         }
     }
 
@@ -682,6 +740,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             putValueArgument(i, transformation(arg))
         }
     }
+
+    private fun IrExpression?.isInlinedBlock() = this?.safeAs<IrReturnableBlock>()?.origin is SuperInlinedFunctionBodyOrigin
 
     private class IrGetValueWithoutLocation(
         override val symbol: IrValueSymbol,
