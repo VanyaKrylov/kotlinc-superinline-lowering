@@ -35,33 +35,6 @@ import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
 
-fun IrReturn.withReturnTargetSymbol(returnTargetSymbol: IrReturnTargetSymbol) =
-    IrReturnImpl(startOffset, endOffset, type, returnTargetSymbol, value)
-
-fun IrValueParameter.isSuperInlineParameter(type: IrType = this.type) =
-    !isNoinline && !type.isNullable() && (type.isFunction() || type.isSuspendFunction())
-
-fun IrFunctionAccessExpression.isInlinableLambdaInvokeCall(): Boolean {
-    val callee = this.symbol.owner
-    val dispatchReceiverParameter = callee.dispatchReceiverParameter ?: return false
-    val dispatchReceiverOrigin = this.dispatchReceiver.safeAs<IrReturnableBlock>()?.origin ?: return false
-
-    return this is IrCall
-            && callee.name == OperatorNameConventions.INVOKE
-            && dispatchReceiverParameter.type.isFunction()
-            && dispatchReceiverOrigin is SuperInlineLowering.SuperInlinedFunctionBodyOrigin
-}
-
-fun IrFunctionAccessExpression.isInlinableExtensionLambdaCall(): Boolean {
-    val callee = this.symbol.owner
-    val extensionReceiverParameter = callee.extensionReceiverParameter ?: return false
-    val extensionReceiverOrigin = this.extensionReceiver.safeAs<IrReturnableBlock>()?.origin ?: return false
-
-    return this is IrCall
-            && callee.isInline
-            && extensionReceiverParameter.type.isFunction()
-            && extensionReceiverOrigin is SuperInlineLowering.SuperInlinedFunctionBodyOrigin
-}
 
 // TODO:
 // 1) Add captured variables support in Inliner via isTopLevelCallSite checks
@@ -99,62 +72,34 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val callee = expression.symbol.owner
 
         if (!callee.hasAnnotation(superInlineAnnotationFqName) &&
-            !callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine) &&
-            !isInliningEnabled ||
+            !callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine) ||
             expression !is IrCall ||
             callee is IrLazyFunction
         ) {
             return super.visitFunctionAccess(expression)
         }
 
-        isInliningEnabled = true
         inliningTriggered = true
 
-        expression.transformChildrenVoid()
-
-        val parent = allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
-            ?: allScopes.map { it.irElement }.filterIsInstance<IrDeclaration>().lastOrNull()?.parent
-            ?: containerScope?.irElement as? IrDeclarationParent
-            ?: (containerScope?.irElement as? IrDeclaration)?.parent
-
-        val scope = currentScope ?: containerScope!!
-        val inliner = Inliner(expression, callee, scope, parent, context)
+        val inliningTransformer = InliningTransformer()
+        expression.transformChildren(inliningTransformer, null)
 
         if (callee.hasAnnotation(superInlineAnnotationFqName) ||
             callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine)
         ) {
+            val parent = allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
+                ?: allScopes.map { it.irElement }.filterIsInstance<IrDeclaration>().lastOrNull()?.parent
+                ?: containerScope?.irElement as? IrDeclarationParent
+                ?: (containerScope?.irElement as? IrDeclaration)?.parent
+
+            val scope = currentScope ?: containerScope!!
+            val inliner = Inliner(expression, callee, scope, parent, context)
             val inlined = inliner.inline()
-            isInliningEnabled = false
 
             return inlined
         }
 
-        when (val dispatchReceiver = expression.dispatchReceiver) {
-            is IrReturnableBlock -> if (expression.isInlinableLambdaInvokeCall() && isInliningEnabled) {
-                val dispatchTransformer = inliner.dispatchReceiverInliningTransformer
-
-                return dispatchReceiver.apply {
-                    transformChildren(dispatchTransformer, dispatchReceiver to expression)
-                    flattenAndPatchReturnTargetSymbol()
-                }
-            }
-        }
-
-        when (val callSiteExtensionReceiver = expression.extensionReceiver) {
-            is IrReturnableBlock -> if (expression.isInlinableExtensionLambdaCall() && isInliningEnabled) {
-                val extensionTransformer = inliner.extensionReceiverInliningTransformer
-
-                return callSiteExtensionReceiver.apply {
-                    transformChildren(extensionTransformer, callSiteExtensionReceiver to expression)
-                    flattenAndPatchReturnTargetSymbol()
-                }
-            }
-        }
-
-        return if (callee.needsInlining && isInliningEnabled)
-            inliner.inline()
-        else
-            expression
+        return expression
     }
 
     private inner class Inliner(
@@ -166,7 +111,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val ignoreDispatchReceiver: Boolean = false,
         val isTopLevelCallSite: Boolean = false
     ) {
-
         val extensionReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = true)
         val dispatchReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = false)
 
@@ -186,22 +130,24 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         fun inline() = inlineFunction(callSite, callee)
 
-        private fun inlineFunction(
+        fun inlineFunction(
             callSite: IrFunctionAccessExpression,
             callee: IrFunction
         ): IrExpression {
             val copiedCallee = (copyIrElement.copy(callee) as IrFunction).apply { parent = callee.parent }
-            val evaluationStatements = evaluateArguments(callSite, copiedCallee)
+            val evaluationStatements = evaluateArguments(
+                callSite.apply { transformValueArguments { it.destructureReturnableBlockIfSingleReturnStatement() } },
+                copiedCallee
+            )
+            val transformer = BodyInliningTransformer()
             val statements = (copiedCallee.body as IrBlockBody).statements
+
+            statements.transform { it.transform(transformer, data = null) }
+            statements.addAll(0, evaluationStatements)
 
             val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl()
             val endOffset = callee.endOffset
             val irBuilder = context.createIrBuilder(irReturnableBlockSymbol, endOffset, endOffset)
-            val transformer = ParameterSubstitutor()
-
-            statements.transform { it.transform(transformer, data = null) }
-
-            statements.addAll(0, evaluationStatements)
 
             return IrReturnableBlockImpl(
                 startOffset = callSite.startOffset,
@@ -226,118 +172,11 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 })
 
                 patchDeclarationParents(parent)
-
                 destructureReturnableBlockIfSingleReturnStatement()
             }
         }
 
-        //---------------------------------------------------------------------//
-
-        private inner class ParameterSubstitutor : IrElementTransformerVoidWithContext() { //todo changed to ..withContext
-
-            override fun visitGetValue(expression: IrGetValue): IrExpression {
-                val newExpression = super.visitGetValue(expression) as IrGetValue
-                val argument = substituteMap[newExpression.symbol.owner] ?: return newExpression
-
-                argument.transformChildrenVoid(this) // Default argument can contain subjects for substitution.
-
-                return if (argument is IrGetValueWithoutLocation)
-                    argument.withLocation(newExpression.startOffset, newExpression.endOffset)
-                else (copyIrElement.copy(argument) as IrExpression)
-            }
-
-            //-----------------------------------------------------------------//
-
-            override fun visitCall(expression: IrCall): IrExpression {
-                expression.transformChildrenVoid() //same as in SuperInlineLowering (transformer) - we are walking the IR tree depth-first
-
-                when (val dispatchReceiver = expression.dispatchReceiver) {
-                    is IrReturnableBlock ->
-                        if (expression.isInlinableLambdaInvokeCall()) {
-
-                            return dispatchReceiver.apply {
-                                transformChildren(dispatchReceiverInliningTransformer, this to expression)
-                                flattenAndPatchReturnTargetSymbol()
-                            }
-                        }
-                }
-
-                when (val callSiteExtensionReceiver = expression.extensionReceiver) {
-                    is IrReturnableBlock ->
-                        if (expression.isInlinableExtensionLambdaCall()) {
-                            val transformer = Inliner(
-                                expression,
-                                expression.symbol.owner,
-                                this@ParameterSubstitutor.currentScope ?: this@Inliner.currentScope,
-                                parent,
-                                context
-                            ).extensionReceiverInliningTransformer
-
-                            return callSiteExtensionReceiver.apply {
-                                transformChildren(transformer, this to expression)
-                                flattenAndPatchReturnTargetSymbol()
-                            }
-                        }
-                }
-
-                if (isLambdaCall(expression)) {
-                    val functionArgument = when (val value = expression.dispatchReceiver) {
-                        is IrGetValue ->
-                            if ((value.symbol.owner as? IrValueParameter)?.isNoinline == true)
-                                return expression
-                            else
-                                substituteMap[value.symbol.owner] ?: return expression
-                        is IrFunctionExpression -> value
-                        else -> TODO("Should be either IrGetValue or IrFunctionExpression")
-                    }
-
-                    if (functionArgument !is IrFunctionExpression)
-                        return expression
-
-                    // Inline the lambda. Lambda parameters will be substituted with lambda arguments.
-                    val newExpression = inlineFunction(
-                        expression.apply { transformValueArguments { it.destructureReturnableBlockIfSingleReturnStatement() } },
-                        functionArgument.function
-                    )
-
-                    // Substitute lambda arguments with target function arguments.
-                    return newExpression.transform(
-                        this,
-                        null
-                    )
-                }
-
-                val callee = expression.symbol.owner
-
-                return if (callee.needsInlining) {
-                    Inliner(
-                        expression,
-                        callee,
-                        this@ParameterSubstitutor.currentScope ?: this@Inliner.currentScope,
-                        parent,
-                        context
-                    ).inline()
-                } else
-                    expression
-            }
-
-            //-----------------------------------------------------------------//
-
-            override fun visitElement(element: IrElement) = element.accept(this, null)
-        }
-
-        private fun isLambdaCall(irCall: IrCall): Boolean {
-            val callee = irCall.symbol.owner
-            val dispatchReceiver = callee.dispatchReceiverParameter ?: return false
-            assert(!dispatchReceiver.type.isKFunction())
-
-            return (dispatchReceiver.type.isFunction() || dispatchReceiver.type.isSuspendFunction())
-                    && callee.name == OperatorNameConventions.INVOKE
-                    && (irCall.dispatchReceiver is IrGetValue
-                    || irCall.dispatchReceiver is IrFunctionExpression) //case when the lambda argument was already substituted
-        }
-
-        //-------------------------------------------------------------------------//
+        private inner class BodyInliningTransformer : InliningTransformer(this)
 
         private inner class ParameterToArgument(
             val parameter: IrValueParameter,
@@ -431,7 +270,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         private fun evaluateArguments(callSite: IrFunctionAccessExpression, callee: IrFunction): List<IrStatement> {
             val arguments = buildParameterToArgument(callSite, callee)
             val evaluationStatements = mutableListOf<IrStatement>()
-            val substitutor = ParameterSubstitutor()
+            val substitutor = BodyInliningTransformer()
             arguments.forEach { argument ->
                 if (argument.isInlinableLambdaArgument) {
                     substituteMap[argument.parameter] = argument.argumentExpression
@@ -477,13 +316,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 if (expression.returnTargetSymbol != callSiteExtensionReceiver.symbol)
                     return super.visitReturn(expression, data)
 
-                val receiverArgument = expression.value.safeAs<IrFunctionExpression>()
-                    ?: return super.visitReturn(
-                        expression,
-                        data
-                    ) //todo remove cast to IrFunctionExpression? because ideally we want to process any argument regardless the type
-
-                val callSite = data.second.apply { transformValueArguments { it.destructureReturnableBlockIfSingleReturnStatement() } }
+                val receiverArgument = expression.value
+                val callSite = data.second
 
                 return if (isExtension)
                     inlineFunction(
@@ -491,9 +325,103 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                         callSite.symbol.owner
                     )
                 else
-                    inlineFunction(callSite, receiverArgument.function)
+                    inlineFunction(
+                        callSite,
+                        receiverArgument.safeAs<IrFunctionExpression>()?.function
+                            ?: return super.visitReturn(
+                                expression,
+                                data
+                            )
+                    )
             }
         }
+    }
+
+    //parentInliner !=null for body inlining and ==null for arguments inlining (when IrCall is passed as an argument)
+    private open inner class InliningTransformer(var parentInliner: Inliner? = null) : IrElementTransformerVoidWithContext() {
+
+        override fun visitGetValue(expression: IrGetValue): IrExpression {
+            if (parentInliner == null) {
+                return super.visitGetValue(expression)
+            } else {
+                with(parentInliner!!) {
+                    val newExpression = super.visitGetValue(expression) as IrGetValue
+                    val argument = substituteMap[newExpression.symbol.owner] ?: return newExpression
+
+                    argument.transformChildrenVoid(this@InliningTransformer) // Default argument can contain subjects for substitution.
+
+                    return if (argument is IrGetValueWithoutLocation)
+                        argument.withLocation(newExpression.startOffset, newExpression.endOffset)
+                    else (copyIrElement.copy(argument) as IrExpression)
+                }
+            }
+        }
+
+        override fun visitCall(expression: IrCall): IrExpression {
+            expression.transformChildrenVoid() //same as in SuperInlineLowering (transformer) - we are walking the IR tree depth-first
+
+            val callee = expression.symbol.owner
+            val parent = allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
+                ?: allScopes.map { it.irElement }.filterIsInstance<IrDeclaration>().lastOrNull()?.parent
+                ?: containerScope?.irElement as? IrDeclarationParent
+                ?: (containerScope?.irElement as? IrDeclaration)?.parent
+
+            val inliner = Inliner(expression, callee, currentScope ?: containerScope!!, parent, context)
+
+            if (expression.isInlinableLambdaInvokeCall()) {
+                val functionArgument =
+                    when (val dispatchReceiver = expression.dispatchReceiver) {
+                        is IrReturnableBlock -> {
+                            val transformer = (parentInliner ?: inliner).dispatchReceiverInliningTransformer
+
+                            return dispatchReceiver.apply {
+                                transformChildren(transformer, this to expression)
+                                flattenAndPatchReturnTargetSymbol()
+                            }
+                        }
+                        is IrGetValue ->
+                            if ((dispatchReceiver.symbol.owner as? IrValueParameter)?.isNoinline == true)
+                                return expression
+                            else
+                                inliner.substituteMap[dispatchReceiver.symbol.owner] ?: return expression
+
+                        is IrFunctionExpression -> dispatchReceiver
+
+                        else -> TODO("Should be either IrGetValue or IrFunctionExpression")
+                    }
+
+                if (functionArgument !is IrFunctionExpression)
+                    return expression
+
+                val newExpression = inliner.inlineFunction(expression, functionArgument.function)
+
+                return if (parentInliner == null)
+                    newExpression
+                else
+                    newExpression.transform(this, null)
+            }
+
+            when (val callSiteExtensionReceiver = expression.extensionReceiver) {
+                is IrReturnableBlock ->
+                    if (expression.isInlinableExtensionLambdaCall()) {
+                        val transformer = inliner.extensionReceiverInliningTransformer
+
+                        return callSiteExtensionReceiver.apply {
+                            transformChildren(transformer, this to expression)
+                            flattenAndPatchReturnTargetSymbol()
+                        }
+                    }
+            }
+
+            return if (callee.needsInlining)
+                inliner.inline()
+            else
+                expression
+        }
+
+        //-----------------------------------------------------------------//
+
+        override fun visitElement(element: IrElement) = element.accept(this, null)
     }
 
     private inner class InliningPostProcessingTransformer(val containerScope: ScopeWithIr) : IrElementTransformerVoid() {
@@ -612,6 +540,33 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
     private fun IrExpression?.isInlinedBlock() = this?.safeAs<IrReturnableBlock>()?.origin is SuperInlinedFunctionBodyOrigin
 
+    private fun IrValueParameter.isSuperInlineParameter(type: IrType = this.type) =
+        !isNoinline && !type.isNullable() && (type.isFunction() || type.isSuspendFunction())
+
+    private fun IrFunctionAccessExpression.isInlinableLambdaInvokeCall(): Boolean {
+        val callee = this.symbol.owner
+        val dispatchReceiverParameter = callee.dispatchReceiverParameter ?: return false
+        assert(!dispatchReceiverParameter.type.isKFunction())
+
+        return this is IrCall
+                && callee.name == OperatorNameConventions.INVOKE
+                && dispatchReceiverParameter.type.isFunction()
+                && (this.dispatchReceiver is IrGetValue
+                || this.dispatchReceiver is IrFunctionExpression
+                || this.dispatchReceiver.safeAs<IrReturnableBlock>()?.origin is SuperInlinedFunctionBodyOrigin)
+    }
+
+    private fun IrFunctionAccessExpression.isInlinableExtensionLambdaCall(): Boolean {
+        val callee = this.symbol.owner
+        val extensionReceiverParameter = callee.extensionReceiverParameter ?: return false
+        val extensionReceiverOrigin = this.extensionReceiver.safeAs<IrReturnableBlock>()?.origin ?: return false
+
+        return this is IrCall
+                && callee.isInline
+                && extensionReceiverParameter.type.isFunction()
+                && extensionReceiverOrigin is SuperInlinedFunctionBodyOrigin
+    }
+
     private class IrGetValueWithoutLocation(
         override val symbol: IrValueSymbol,
         override val origin: IrStatementOrigin? = null
@@ -638,3 +593,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
     class SuperInlinedFunctionBodyOrigin(val calleeName: String) : IrStatementOriginImpl("")
 }
+
+fun IrReturn.withReturnTargetSymbol(returnTargetSymbol: IrReturnTargetSymbol) =
+    IrReturnImpl(startOffset, endOffset, type, returnTargetSymbol, value)
