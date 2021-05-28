@@ -46,7 +46,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
     private var inliningTriggered: Boolean = false
 
     private val postProcessingEvaluationStatements = mutableListOf<IrStatement>()
-    private val capturedVariables = mutableListOf<IrVariable>()
+    private var capturedVariables = mutableListOf<IrVariable>()
 
     override fun lower(irBody: IrBody, container: IrDeclaration) {
         containerScope = createScope(container as IrSymbolOwner)
@@ -82,8 +82,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         inliningTriggered = true
 
-        val inliningTransformer = InliningTransformer()
-        expression.transformChildren(inliningTransformer, null)
+        /*val inliningTransformer = InliningTransformer()
+        expression.transformChildren(inliningTransformer, null)*/
 
         if (callee.hasAnnotation(superInlineAnnotationFqName) ||
             callee.hasAnnotation(superInlineAnnotationFqNameForCommandLine)
@@ -179,7 +179,11 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     val capturedVarsTransformer = FunctionalArgumentCapturedVariablesTransformer(capturedVariables, currentScope)
                     acceptChildren(variableCapturingVisitor, capturedVariables)
                     transformChildren(capturedVarsTransformer, null)
-                }
+                } /*else {
+                    this.statements.addAll(0, this@SuperInlineLowering.capturedVariables)
+                    if (this@SuperInlineLowering.capturedVariables.isNotEmpty())
+                        this@SuperInlineLowering.capturedVariables = mutableListOf()
+                }*/
 
                 patchDeclarationParents(parent)
                 destructureReturnableBlockIfSingleReturnStatement()
@@ -442,6 +446,10 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             else
                 expression
         }
+
+        /*override fun visitFunctionExpression(expression: IrFunctionExpression): IrExpression {
+            return expression //calls inside lambdas should only be processed when the lambda is invoked
+        }*/
 
         //-----------------------------------------------------------------//
 
