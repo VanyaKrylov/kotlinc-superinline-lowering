@@ -17,12 +17,14 @@ import org.jetbrains.kotlin.ir.types.*
 import org.jetbrains.kotlin.ir.types.impl.buildSimpleType
 import org.jetbrains.kotlin.ir.types.impl.makeTypeProjection
 import org.jetbrains.kotlin.ir.util.*
+import org.jetbrains.kotlin.ir.visitors.IrElementTransformer
 import org.jetbrains.kotlin.ir.visitors.acceptVoid
 import org.jetbrains.kotlin.name.Name
 
 internal class DeepCopyIrTreeWithSymbolsForInliner(
     val typeArguments: Map<IrTypeParameterSymbol, IrType?>?,
-    val parent: IrDeclarationParent?
+    val parent: IrDeclarationParent?,
+    val isJvmTarget: Boolean = false
 ) {
 
     fun copy(irElement: IrElement): IrElement {
@@ -39,15 +41,46 @@ internal class DeepCopyIrTreeWithSymbolsForInliner(
         return result
     }
 
-    private var nameIndex = 0
+    fun jvmCopy(irElement: IrElement): IrElement {
+        irElement.acceptVoid(symbolRemapper)
+        symbolRemapper.typeArguments = typeArguments
+        val result = irElement.transform(jvmCopier, data = null)
+        result.patchDeclarationParents(parent)
 
-    private fun generateCopyName(name: Name) = Name.identifier(name.toString() + "_" + (nameIndex++).toString())
+        return result
+    }
+
+    private var nameIndex = 0
+    lateinit var delimiterChar: String
+
+    init {
+        delimiterChar = if (isJvmTarget) "$" else "_"
+    }
+
+    private fun generateCopyName(name: Name) =
+        if (name.isSpecial) name else Name.identifier(name.toString() + delimiterChar + (nameIndex++).toString())
+
+    private fun generateJvmCopyName(name: Name) = Name.identifier(name.toString() + "$" + (nameIndex++).toString())
 
     private inner class InlinerSymbolRenamer : SymbolRenamer {
         private val map = mutableMapOf<IrSymbol, Name>()
 
         override fun getClassName(symbol: IrClassSymbol) = map.getOrPut(symbol) { generateCopyName(symbol.owner.name) }
         override fun getFunctionName(symbol: IrSimpleFunctionSymbol) = map.getOrPut(symbol) { generateCopyName(symbol.owner.name) }
+        override fun getFieldName(symbol: IrFieldSymbol) = symbol.owner.name
+        override fun getFileName(symbol: IrFileSymbol) = symbol.owner.fqName
+        override fun getExternalPackageFragmentName(symbol: IrExternalPackageFragmentSymbol) = symbol.owner.fqName
+        override fun getEnumEntryName(symbol: IrEnumEntrySymbol) = symbol.owner.name
+        override fun getVariableName(symbol: IrVariableSymbol) = map.getOrPut(symbol) { generateCopyName(symbol.owner.name) }
+        override fun getTypeParameterName(symbol: IrTypeParameterSymbol) = symbol.owner.name
+        override fun getValueParameterName(symbol: IrValueParameterSymbol) = symbol.owner.name
+    }
+
+    private inner class JvmInlinerSymbolRenamer : SymbolRenamer {
+        private val map = mutableMapOf<IrSymbol, Name>()
+
+        override fun getClassName(symbol: IrClassSymbol) = map.getOrPut(symbol) { generateJvmCopyName(symbol.owner.name) }
+        override fun getFunctionName(symbol: IrSimpleFunctionSymbol) = map.getOrPut(symbol) { generateJvmCopyName(symbol.owner.name) }
         override fun getFieldName(symbol: IrFieldSymbol) = symbol.owner.name
         override fun getFileName(symbol: IrFileSymbol) = symbol.owner.fqName
         override fun getExternalPackageFragmentName(symbol: IrExternalPackageFragmentSymbol) = symbol.owner.fqName
@@ -131,6 +164,19 @@ internal class DeepCopyIrTreeWithSymbolsForInliner(
     private val symbolRemapper = SymbolRemapperImpl(NullDescriptorsRemapper)
     private val typeRemapper = InlinerTypeRemapper(symbolRemapper, typeArguments)
     private val copier = object : DeepCopyIrTreeWithSymbols(symbolRemapper, typeRemapper, InlinerSymbolRenamer()) {
+        private fun IrType.remapTypeAndErase() = typeRemapper.remapTypeAndOptionallyErase(this, erase = true)
+
+        override fun visitTypeOperator(expression: IrTypeOperatorCall) =
+            IrTypeOperatorCallImpl(
+                expression.startOffset, expression.endOffset,
+                expression.type.remapTypeAndErase(),
+                expression.operator,
+                expression.typeOperand.remapTypeAndErase(),
+                expression.argument.transform()
+            ).copyAttributes(expression)
+    }
+
+    private val jvmCopier = object : DeepCopyIrTreeWithSymbols(symbolRemapper, typeRemapper, JvmInlinerSymbolRenamer()) {
         private fun IrType.remapTypeAndErase() = typeRemapper.remapTypeAndOptionallyErase(this, erase = true)
 
         override fun visitTypeOperator(expression: IrTypeOperatorCall) =

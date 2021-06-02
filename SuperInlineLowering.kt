@@ -7,14 +7,10 @@
 
 package org.jetbrains.kotlin.backend.common.lower.inline
 
-import org.jetbrains.kotlin.backend.common.BodyLoweringPass
-import org.jetbrains.kotlin.backend.common.CommonBackendContext
-import org.jetbrains.kotlin.backend.common.IrElementTransformerVoidWithContext
-import org.jetbrains.kotlin.backend.common.ScopeWithIr
+import org.jetbrains.kotlin.backend.common.*
 import org.jetbrains.kotlin.backend.common.lower.createIrBuilder
 import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.IrStatement
-import org.jetbrains.kotlin.ir.ObsoleteDescriptorBasedAPI
 import org.jetbrains.kotlin.ir.UNDEFINED_OFFSET
 import org.jetbrains.kotlin.ir.builders.*
 import org.jetbrains.kotlin.ir.declarations.*
@@ -23,9 +19,7 @@ import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.*
 import org.jetbrains.kotlin.ir.symbols.IrReturnTargetSymbol
 import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
-import org.jetbrains.kotlin.ir.symbols.impl.IrClassSymbolImpl
 import org.jetbrains.kotlin.ir.symbols.impl.IrReturnableBlockSymbolImpl
-import org.jetbrains.kotlin.ir.symbols.impl.IrSimpleFunctionSymbolImpl
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.isNullable
 import org.jetbrains.kotlin.ir.types.isUnit
@@ -35,7 +29,6 @@ import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
 import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
 import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
 import org.jetbrains.kotlin.name.FqName
-import org.jetbrains.kotlin.name.SpecialNames
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
 
@@ -129,7 +122,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 (0 until callSite.typeArgumentsCount).associate {
                     typeParameters[it].symbol to callSite.getTypeArgument(it)
                 }
-            DeepCopyIrTreeWithSymbolsForInliner(typeArguments, parent)
+            DeepCopyIrTreeWithSymbolsForInliner(typeArguments, parent, isJvmTarget = true)
         }
 
         val substituteMap = mutableMapOf<IrValueParameter, IrExpression>()
@@ -141,13 +134,10 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             callee: IrFunction
         ): IrExpression {
             val copiedCallee = (copyIrElement.copy(callee) as IrFunction).apply { parent = callee.parent }
-            val evaluationStatements = evaluateArguments(
-                callSite.apply { transformValueArguments { it.destructureReturnableBlockIfSingleReturnStatement() } },
-                copiedCallee
-            )
-            val transformer = BodyInliningTransformer()
+            val evaluationStatements = evaluateArguments(callSite.prepareValueArguments(), copiedCallee)
             val statements = (copiedCallee.body as IrBlockBody).statements
 
+            val transformer = BodyInliningTransformer()
             statements.transform { runInliningTransformerWithResetFlags(transformer, it) }
             statements.addAll(0, evaluationStatements)
 
@@ -162,7 +152,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 symbol = irReturnableBlockSymbol,
                 origin = SuperInlinedFunctionBodyOrigin(callee.symbol.owner.name.toString()),
                 statements = statements,
-                inlineFunctionSymbol = callee.symbol
+                inlineFunctionSymbol = copiedCallee.symbol // todo: change back to callee.symbol
             ).apply {
                 flattenAndPatchReturnTargetSymbol()
 
@@ -561,9 +551,10 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         override fun visitVariable(declaration: IrVariable): IrStatement {
             declaration.transformChildrenVoid()
 
-            if (declaration.initializer.isInlinedBlock()) {
+            if (isInlinedInitializer(declaration.initializer)) {
                 val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(declaration.type, declaration.name.toString())
-                val initializer = declaration.initializer as IrReturnableBlock
+                val initializer = declaration.initializer.safeAs()
+                    ?: (declaration.initializer as IrBlock).statements.last() as IrReturnableBlock
 
                 initializer.transformChildren(object : IrElementTransformerVoid() {
                     override fun visitReturn(expression: IrReturn): IrExpression {
@@ -601,7 +592,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         // The initial problem is that the arguments passed to the top level inlined function are later unnecessary copied in cases
         // when they are later passed as extensionReceiverArguments. The solution is to introduce custom DeepCopyIrTree transformer to
         // only substitute type parameters without copying the other nodes
-        @OptIn(ObsoleteDescriptorBasedAPI::class)
+        /* @OptIn(ObsoleteDescriptorBasedAPI::class)
         override fun visitClass(declaration: IrClass): IrStatement {
             if (declaration.name.toString().contains(SpecialNames.NO_NAME_PROVIDED.toString())) {
                 super.visitClass(declaration)
@@ -677,7 +668,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             }
 
             return super.visitSimpleFunction(declaration)
-        }
+        }*/
     }
 
     private fun IrReturnableBlock.flattenAndPatchReturnTargetSymbol() = apply {
@@ -688,7 +679,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             override fun visitReturn(expression: IrReturn): IrExpression {
                 return if (expression.returnTargetSymbol == innerReturnableBlockSymbol)
-                    expression.withReturnTargetSymbol(irReturnableBlockSymbol)
+                    expression.withReturnTargetSymbol(irReturnableBlockSymbol).also { this@flattenAndPatchReturnTargetSymbol.type = expression.value.type }
                 else
                     super.visitReturn(expression)
             }
@@ -742,6 +733,36 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             else -> this
         }
 
+    private fun IrExpression.wrapIntoFunctionExpressionIfIsReturnableBlock() =
+        when (this) {
+            is IrReturnableBlock ->
+                if (this.type.isFunction())
+                    wrapIntoFunctionExpression(this) ?: this
+                else this
+            else -> this
+        }
+
+    private fun wrapIntoFunctionExpression(irReturnableBlock: IrReturnableBlock): IrFunctionExpression? {
+
+        return IrFunctionExpressionImpl(
+            irReturnableBlock.startOffset,
+            irReturnableBlock.endOffset,
+            irReturnableBlock.type,
+            irReturnableBlock.inlineFunctionSymbol?.owner.safeAs<IrSimpleFunction>()?.apply {
+                body = context.irFactory.createBlockBody(irReturnableBlock.startOffset, irReturnableBlock.endOffset) {
+                    statements.add(irReturnableBlock)
+                }
+            } ?: return null,
+            IrStatementOrigin.LAMBDA
+        )
+    }
+
+    private fun IrFunctionAccessExpression.prepareValueArguments() = this.apply {
+        transformValueArguments {
+            it.destructureReturnableBlockIfSingleReturnStatement()
+        }
+    }
+
     private fun IrFunctionAccessExpression.transformValueArguments(transformation: (IrExpression) -> IrExpression) {
         for (i in 0 until valueArgumentsCount) {
             val arg = getValueArgument(i) ?: continue
@@ -749,7 +770,10 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         }
     }
 
-    private fun IrExpression?.isInlinedBlock() = this?.safeAs<IrReturnableBlock>()?.origin is SuperInlinedFunctionBodyOrigin
+    private fun IrStatement?.isInlinedBlock() = this?.safeAs<IrReturnableBlock>()?.origin is SuperInlinedFunctionBodyOrigin
+
+    private fun isInlinedInitializer(irStatement: IrStatement?) =
+        irStatement?.isInlinedBlock() == true || irStatement?.safeAs<IrBlock>()?.statements?.singleOrNull()?.isInlinedBlock() ?: false
 
     private fun IrValueParameter.isSuperInlineParameter(type: IrType = this.type) =
         !isNoinline && !type.isNullable() && (type.isFunction() || type.isSuspendFunction())
