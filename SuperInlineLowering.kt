@@ -14,6 +14,7 @@ import org.jetbrains.kotlin.backend.common.ScopeWithIr
 import org.jetbrains.kotlin.backend.common.lower.createIrBuilder
 import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.IrStatement
+import org.jetbrains.kotlin.ir.ObsoleteDescriptorBasedAPI
 import org.jetbrains.kotlin.ir.UNDEFINED_OFFSET
 import org.jetbrains.kotlin.ir.builders.*
 import org.jetbrains.kotlin.ir.declarations.*
@@ -22,7 +23,9 @@ import org.jetbrains.kotlin.ir.expressions.*
 import org.jetbrains.kotlin.ir.expressions.impl.*
 import org.jetbrains.kotlin.ir.symbols.IrReturnTargetSymbol
 import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
+import org.jetbrains.kotlin.ir.symbols.impl.IrClassSymbolImpl
 import org.jetbrains.kotlin.ir.symbols.impl.IrReturnableBlockSymbolImpl
+import org.jetbrains.kotlin.ir.symbols.impl.IrSimpleFunctionSymbolImpl
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.isNullable
 import org.jetbrains.kotlin.ir.types.isUnit
@@ -32,6 +35,7 @@ import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
 import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
 import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
 import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.name.SpecialNames
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
 
@@ -115,6 +119,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val extensionReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = true)
         val dispatchReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = false)
 
+        //TODO: make lazy
         val copyIrElement = run {
             val typeParameters =
                 if (callee is IrConstructor)
@@ -143,7 +148,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             val transformer = BodyInliningTransformer()
             val statements = (copiedCallee.body as IrBlockBody).statements
 
-            statements.transform { runInliningTransformerWithResetInvocationFlag(transformer, it) }
+            statements.transform { runInliningTransformerWithResetFlags(transformer, it) }
             statements.addAll(0, evaluationStatements)
 
             val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl()
@@ -172,14 +177,15 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     }
                 })
 
+                //todo: remove condition - capturing should run always
                 //move captured variables' declarations to the top of the containerScope for calls inside arguments
-                if (needsCapturing) {
+                /*if (needsCapturing) {
                     val capturedVariables = mutableSetOf<IrVariable>()
                     val variableCapturingVisitor = CapturedVariablesInFunctionalReturnValuesVisitor(irReturnableBlockSymbol)
                     val capturedVarsTransformer = FunctionalArgumentCapturedVariablesTransformer(capturedVariables, currentScope)
                     acceptChildren(variableCapturingVisitor, capturedVariables)
                     transformChildren(capturedVarsTransformer, null)
-                } /*else {
+                }*/ /*else {
                     this.statements.addAll(0, this@SuperInlineLowering.capturedVariables)
                     if (this@SuperInlineLowering.capturedVariables.isNotEmpty())
                         this@SuperInlineLowering.capturedVariables = mutableListOf()
@@ -350,13 +356,17 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             }
         }
 
-        private fun runInliningTransformerWithResetInvocationFlag(transformer: InliningTransformer, statement: IrStatement) =
-            statement.transform(transformer.apply { this.isFirstInvocation = true }, null)
+        private fun runInliningTransformerWithResetFlags(transformer: InliningTransformer, statement: IrStatement) =
+            statement.transform(transformer.apply {
+                this.isFirstInvocation = true
+                this.isInliningAllowed = true
+            }, null)
     }
 
     //parentInliner !=null for body inlining and ==null for arguments inlining (when IrCall is passed as an argument)
     private open inner class InliningTransformer(var parentInliner: Inliner? = null) : IrElementTransformerVoidWithContext() {
         var isFirstInvocation: Boolean = true
+        var isInliningAllowed: Boolean = true
 
         override fun visitGetValue(expression: IrGetValue): IrExpression {
             if (parentInliner == null) {
@@ -400,6 +410,9 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 val functionArgument =
                     when (val dispatchReceiver = expression.dispatchReceiver) {
                         is IrReturnableBlock -> {
+                            if (!isInliningAllowed)
+                                return expression
+
                             val transformer = (parentInliner ?: inliner).dispatchReceiverInliningTransformer
 
                             return dispatchReceiver.apply {
@@ -431,7 +444,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             when (val callSiteExtensionReceiver = expression.extensionReceiver) {
                 is IrReturnableBlock ->
-                    if (expression.isInlinableExtensionLambdaCall()) {
+                    if (expression.isInlinableExtensionLambdaCall() && isInliningAllowed) {
                         val transformer = inliner.extensionReceiverInliningTransformer
 
                         return callSiteExtensionReceiver.apply {
@@ -441,20 +454,26 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     }
             }
 
-            return if (callee.needsInlining)
+            return if (callee.needsInlining && isInliningAllowed)
                 inliner.inline()
             else
                 expression
         }
 
-        /*override fun visitFunctionExpression(expression: IrFunctionExpression): IrExpression {
-            return expression //calls inside lambdas should only be processed when the lambda is invoked
-        }*/
+        //calls inside lambdas should only be processed when the lambda is invoked
+        override fun visitFunctionExpression(expression: IrFunctionExpression): IrExpression {
+            val tmp = isInliningAllowed
+            isInliningAllowed = false
+            val res = super.visitFunctionExpression(expression)
+            isInliningAllowed = tmp
 
-        //-----------------------------------------------------------------//
+            return res
+        }
 
         override fun visitElement(element: IrElement) = element.accept(this, null)
     }
+
+    //-----------------------------------------------------------------//
 
     private inner class CapturedVariablesInFunctionalReturnValuesVisitor(
         val returnTargetSymbol: IrReturnTargetSymbol
@@ -576,6 +595,88 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             }
 
             return declaration
+        }
+
+        //TODO: remove this hack
+        // The initial problem is that the arguments passed to the top level inlined function are later unnecessary copied in cases
+        // when they are later passed as extensionReceiverArguments. The solution is to introduce custom DeepCopyIrTree transformer to
+        // only substitute type parameters without copying the other nodes
+        @OptIn(ObsoleteDescriptorBasedAPI::class)
+        override fun visitClass(declaration: IrClass): IrStatement {
+            if (declaration.name.toString().contains(SpecialNames.NO_NAME_PROVIDED.toString())) {
+                super.visitClass(declaration)
+
+                return declaration.factory.createClass(
+                    declaration.startOffset,
+                    declaration.endOffset,
+                    declaration.origin,
+                    IrClassSymbolImpl(declaration.symbol.descriptor),
+                    SpecialNames.NO_NAME_PROVIDED,
+                    declaration.kind,
+                    declaration.visibility,
+                    declaration.modality,
+                    declaration.isCompanion,
+                    declaration.isInner,
+                    declaration.isData,
+                    declaration.isExternal,
+                    declaration.isInline,
+                    declaration.isExpect,
+                    declaration.isFun,
+                    declaration.source
+                ).apply {
+                    annotations = declaration.annotations
+                    thisReceiver = declaration.thisReceiver
+                    typeParameters = declaration.typeParameters
+                    superTypes = declaration.superTypes
+                    declarations.addAll(declaration.declarations)
+                    parent = declaration.parent
+                    metadata = declaration.metadata
+                }.copyAttributes(declaration)
+            }
+
+            return super.visitClass(declaration)
+        }
+
+        @OptIn(ObsoleteDescriptorBasedAPI::class)
+        override fun visitSimpleFunction(declaration: IrSimpleFunction): IrStatement {
+            if (declaration.origin is IrDeclarationOrigin.LOCAL_FUNCTION_FOR_LAMBDA &&
+                declaration.name.toString().contains(SpecialNames.ANONYMOUS)) {
+                super.visitSimpleFunction(declaration)
+
+                return declaration.factory.createFunction(
+                    declaration.startOffset,
+                    declaration.endOffset,
+                    declaration.origin,
+                    IrSimpleFunctionSymbolImpl(declaration.symbol.descriptor),
+                    SpecialNames.ANONYMOUS_FUNCTION,
+                    declaration.visibility,
+                    declaration.modality,
+                    declaration.returnType,
+                    declaration.isInline,
+                    declaration.isExternal,
+                    declaration.isTailrec,
+                    declaration.isSuspend,
+                    declaration.isOperator,
+                    declaration.isInfix,
+                    declaration.isExpect,
+                    declaration.isFakeOverride,
+                    declaration.containerSource
+                ).apply {
+                    parent = declaration.parent
+                    annotations = declaration.annotations
+                    returnType = declaration.returnType
+                    typeParameters = declaration.typeParameters
+                    dispatchReceiverParameter = declaration.dispatchReceiverParameter
+                    extensionReceiverParameter = declaration.extensionReceiverParameter
+                    valueParameters = declaration.valueParameters
+                    body = declaration.body
+                    metadata = declaration.metadata
+                    overriddenSymbols = declaration.overriddenSymbols
+                    correspondingPropertySymbol = declaration.correspondingPropertySymbol
+                }.copyAttributes(declaration)
+            }
+
+            return super.visitSimpleFunction(declaration)
         }
     }
 
