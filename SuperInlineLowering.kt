@@ -173,7 +173,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     val capturedVarsTransformer = FunctionalArgumentCapturedVariablesTransformer(capturedVariables, currentScope)
                     acceptChildren(variableCapturingVisitor, capturedVariables)
                     transformChildren(capturedVarsTransformer, null)
-                } *//*else {
+                }*/ /*else {
                     this.statements.addAll(0, this@SuperInlineLowering.capturedVariables)
                     if (this@SuperInlineLowering.capturedVariables.isNotEmpty())
                         this@SuperInlineLowering.capturedVariables = mutableListOf()
@@ -685,7 +685,10 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             val returnStatement = statements.last().safeAs<IrReturn>()
             if (isSingleReturnBlock() && returnStatement?.returnTargetSymbol == this.symbol) {
                 movedStatements.addAll(statements.filterUnitStubs().dropLast(1))
-                statements.removeAll { it != returnStatement }
+                statements.apply {
+                    clear()
+                    add(returnStatement)
+                }
             }
         } ?: this
 
