@@ -24,10 +24,7 @@ import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.isNullable
 import org.jetbrains.kotlin.ir.types.isUnit
 import org.jetbrains.kotlin.ir.util.*
-import org.jetbrains.kotlin.ir.visitors.IrElementTransformer
-import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
-import org.jetbrains.kotlin.ir.visitors.IrElementVisitor
-import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
+import org.jetbrains.kotlin.ir.visitors.*
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
@@ -134,12 +131,13 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             callee: IrFunction
         ): IrExpression {
             val copiedCallee = (copyIrElement.copy(callee) as IrFunction).apply { parent = callee.parent }
-            val evaluationStatements = evaluateArguments(callSite.prepareValueArguments(), copiedCallee)
+            val movedFromArgumentsStatements = mutableListOf<IrStatement>()
+            val evaluationStatements = evaluateArguments(callSite.prepareValueArguments(movedFromArgumentsStatements), copiedCallee)
             val statements = (copiedCallee.body as IrBlockBody).statements
 
             val transformer = BodyInliningTransformer()
             statements.transform { runInliningTransformerWithResetFlags(transformer, it) }
-            statements.addAll(0, evaluationStatements)
+            statements.addAll(0, movedFromArgumentsStatements + evaluationStatements)
 
             val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl()
             val endOffset = callee.endOffset
@@ -175,14 +173,14 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     val capturedVarsTransformer = FunctionalArgumentCapturedVariablesTransformer(capturedVariables, currentScope)
                     acceptChildren(variableCapturingVisitor, capturedVariables)
                     transformChildren(capturedVarsTransformer, null)
-                }*/ /*else {
+                } *//*else {
                     this.statements.addAll(0, this@SuperInlineLowering.capturedVariables)
                     if (this@SuperInlineLowering.capturedVariables.isNotEmpty())
                         this@SuperInlineLowering.capturedVariables = mutableListOf()
                 }*/
 
                 patchDeclarationParents(parent)
-                destructureReturnableBlockIfSingleReturnStatement()
+                destructureIfIsOnlyReturnStatement()
             }
         }
 
@@ -322,8 +320,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         private inner class ReceiverInliningTransformer(val isExtension: Boolean) : IrElementTransformer<Pair<IrReturnableBlock, IrCall>> {
 
             override fun visitReturn(expression: IrReturn, data: Pair<IrReturnableBlock, IrCall>): IrExpression {
-                val callSiteExtensionReceiver = data.first
-                if (expression.returnTargetSymbol != callSiteExtensionReceiver.symbol)
+                val callReceiverBlock = data.first
+                if (expression.returnTargetSymbol != callReceiverBlock.symbol)
                     return super.visitReturn(expression, data)
 
                 val receiverArgument = expression.value
@@ -338,10 +336,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     inlineFunction(
                         callSite,
                         receiverArgument.safeAs<IrFunctionExpression>()?.function
-                            ?: return super.visitReturn(
-                                expression,
-                                data
-                            )
+                            ?: return super.visitReturn(expression, data)
                     )
             }
         }
@@ -397,29 +392,27 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             )
 
             if (expression.isInlinableLambdaInvokeCall()) {
-                val functionArgument =
-                    when (val dispatchReceiver = expression.dispatchReceiver) {
-                        is IrReturnableBlock -> {
-                            if (!isInliningAllowed)
-                                return expression
 
-                            val transformer = (parentInliner ?: inliner).dispatchReceiverInliningTransformer
+                val functionArgument = when (val dispatchReceiver = expression.dispatchReceiver) {
 
-                            return dispatchReceiver.apply {
-                                transformChildren(transformer, this to expression)
-                                flattenAndPatchReturnTargetSymbol()
-                            }
-                        }
-                        is IrGetValue ->
-                            if ((dispatchReceiver.symbol.owner as? IrValueParameter)?.isNoinline == true)
-                                return expression
-                            else
-                                inliner.substituteMap[dispatchReceiver.symbol.owner] ?: return expression
+                    is IrReturnableBlock -> {
+                        if (!isInliningAllowed)
+                            return expression
+                        val transformer = (parentInliner ?: inliner).dispatchReceiverInliningTransformer
 
-                        is IrFunctionExpression -> dispatchReceiver
-
-                        else -> TODO("Should be either IrGetValue or IrFunctionExpression")
+                        return dispatchReceiver.postProcessReceiverInliningResult(transformer, dispatchReceiver to expression)
                     }
+
+                    is IrGetValue ->
+                        if ((dispatchReceiver.symbol.owner as? IrValueParameter)?.isNoinline == true)
+                            return expression
+                        else
+                            inliner.substituteMap[dispatchReceiver.symbol.owner] ?: return expression
+
+                    is IrFunctionExpression -> dispatchReceiver
+
+                    else -> TODO("Should be either IrGetValue or IrFunctionExpression")
+                }
 
                 if (functionArgument !is IrFunctionExpression)
                     return expression
@@ -437,10 +430,10 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                     if (expression.isInlinableExtensionLambdaCall() && isInliningAllowed) {
                         val transformer = inliner.extensionReceiverInliningTransformer
 
-                        return callSiteExtensionReceiver.apply {
-                            transformChildren(transformer, this to expression)
-                            flattenAndPatchReturnTargetSymbol()
-                        }
+                        return callSiteExtensionReceiver.postProcessReceiverInliningResult(
+                            transformer,
+                            callSiteExtensionReceiver to expression
+                        )
                     }
             }
 
@@ -461,6 +454,16 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         }
 
         override fun visitElement(element: IrElement) = element.accept(this, null)
+
+        private fun IrReturnableBlock.postProcessReceiverInliningResult(
+            transformer: IrElementTransformer<Pair<IrReturnableBlock, IrCall>>,
+            data: Pair<IrReturnableBlock, IrCall>
+        ) = this.apply {
+            val movedStatements = mutableListOf<IrStatement>()
+            transformChildren(transformer, data.apply { this.second.destructureSingleReturnBlockArguments(movedStatements) })
+            statements.addAll(0, movedStatements)
+            flattenAndPatchReturnTargetSymbol()
+        }
     }
 
     //-----------------------------------------------------------------//
@@ -587,88 +590,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             return declaration
         }
-
-        //TODO: remove this hack
-        // The initial problem is that the arguments passed to the top level inlined function are later unnecessary copied in cases
-        // when they are later passed as extensionReceiverArguments. The solution is to introduce custom DeepCopyIrTree transformer to
-        // only substitute type parameters without copying the other nodes
-        /* @OptIn(ObsoleteDescriptorBasedAPI::class)
-        override fun visitClass(declaration: IrClass): IrStatement {
-            if (declaration.name.toString().contains(SpecialNames.NO_NAME_PROVIDED.toString())) {
-                super.visitClass(declaration)
-
-                return declaration.factory.createClass(
-                    declaration.startOffset,
-                    declaration.endOffset,
-                    declaration.origin,
-                    IrClassSymbolImpl(declaration.symbol.descriptor),
-                    SpecialNames.NO_NAME_PROVIDED,
-                    declaration.kind,
-                    declaration.visibility,
-                    declaration.modality,
-                    declaration.isCompanion,
-                    declaration.isInner,
-                    declaration.isData,
-                    declaration.isExternal,
-                    declaration.isInline,
-                    declaration.isExpect,
-                    declaration.isFun,
-                    declaration.source
-                ).apply {
-                    annotations = declaration.annotations
-                    thisReceiver = declaration.thisReceiver
-                    typeParameters = declaration.typeParameters
-                    superTypes = declaration.superTypes
-                    declarations.addAll(declaration.declarations)
-                    parent = declaration.parent
-                    metadata = declaration.metadata
-                }.copyAttributes(declaration)
-            }
-
-            return super.visitClass(declaration)
-        }
-
-        @OptIn(ObsoleteDescriptorBasedAPI::class)
-        override fun visitSimpleFunction(declaration: IrSimpleFunction): IrStatement {
-            if (declaration.origin is IrDeclarationOrigin.LOCAL_FUNCTION_FOR_LAMBDA &&
-                declaration.name.toString().contains(SpecialNames.ANONYMOUS)) {
-                super.visitSimpleFunction(declaration)
-
-                return declaration.factory.createFunction(
-                    declaration.startOffset,
-                    declaration.endOffset,
-                    declaration.origin,
-                    IrSimpleFunctionSymbolImpl(declaration.symbol.descriptor),
-                    SpecialNames.ANONYMOUS_FUNCTION,
-                    declaration.visibility,
-                    declaration.modality,
-                    declaration.returnType,
-                    declaration.isInline,
-                    declaration.isExternal,
-                    declaration.isTailrec,
-                    declaration.isSuspend,
-                    declaration.isOperator,
-                    declaration.isInfix,
-                    declaration.isExpect,
-                    declaration.isFakeOverride,
-                    declaration.containerSource
-                ).apply {
-                    parent = declaration.parent
-                    annotations = declaration.annotations
-                    returnType = declaration.returnType
-                    typeParameters = declaration.typeParameters
-                    dispatchReceiverParameter = declaration.dispatchReceiverParameter
-                    extensionReceiverParameter = declaration.extensionReceiverParameter
-                    valueParameters = declaration.valueParameters
-                    body = declaration.body
-                    metadata = declaration.metadata
-                    overriddenSymbols = declaration.overriddenSymbols
-                    correspondingPropertySymbol = declaration.correspondingPropertySymbol
-                }.copyAttributes(declaration)
-            }
-
-            return super.visitSimpleFunction(declaration)
-        }*/
     }
 
     private fun IrReturnableBlock.flattenAndPatchReturnTargetSymbol() = apply {
@@ -679,7 +600,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
             override fun visitReturn(expression: IrReturn): IrExpression {
                 return if (expression.returnTargetSymbol == innerReturnableBlockSymbol)
-                    expression.withReturnTargetSymbol(irReturnableBlockSymbol).also { this@flattenAndPatchReturnTargetSymbol.type = expression.value.type }
+                    expression.withReturnTargetSymbol(irReturnableBlockSymbol)
+                        .also { this@flattenAndPatchReturnTargetSymbol.type = expression.value.type }
                 else
                     super.visitReturn(expression)
             }
@@ -726,40 +648,51 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
     private fun MutableList<IrStatement>.filterUnitStubs() =
         this.filterNot { it.safeAs<IrGetObjectValue>()?.type?.isUnit() ?: false }
 
-    private fun IrExpression.destructureReturnableBlockIfSingleReturnStatement() =
+    private fun IrExpression.destructureIfIsOnlyReturnStatement() =
         when (this) {
             //unit stubs come from captured variables
             is IrReturnableBlock -> statements.filterUnitStubs().singleOrNull()?.safeAs<IrReturn>()?.value ?: this
             else -> this
         }
 
-    private fun IrExpression.wrapIntoFunctionExpressionIfIsReturnableBlock() =
-        when (this) {
-            is IrReturnableBlock ->
-                if (this.type.isFunction())
-                    wrapIntoFunctionExpression(this) ?: this
-                else this
-            else -> this
-        }
+    private fun IrReturnableBlock.isSingleReturnBlock(): Boolean {
+        var count = 0
 
-    private fun wrapIntoFunctionExpression(irReturnableBlock: IrReturnableBlock): IrFunctionExpression? {
+        this.acceptChildrenVoid(object : IrElementVisitorVoid {
+            override fun visitElement(element: IrElement) {
+                if (count < 1)
+                    element.acceptChildren(this, null)
+            }
 
-        return IrFunctionExpressionImpl(
-            irReturnableBlock.startOffset,
-            irReturnableBlock.endOffset,
-            irReturnableBlock.type,
-            irReturnableBlock.inlineFunctionSymbol?.owner.safeAs<IrSimpleFunction>()?.apply {
-                body = context.irFactory.createBlockBody(irReturnableBlock.startOffset, irReturnableBlock.endOffset) {
-                    statements.add(irReturnableBlock)
-                }
-            } ?: return null,
-            IrStatementOrigin.LAMBDA
-        )
+            override fun visitReturn(expression: IrReturn) {
+                if (expression.returnTargetSymbol == this@isSingleReturnBlock.symbol)
+                    count++
+                super.visitReturn(expression)
+            }
+        })
+
+        return count == 1
     }
 
-    private fun IrFunctionAccessExpression.prepareValueArguments() = this.apply {
+    private fun IrCall.destructureSingleReturnBlockArguments(movedStatements: MutableList<IrStatement>) = this.apply {
         transformValueArguments {
-            it.destructureReturnableBlockIfSingleReturnStatement()
+            it.transformSingleReturnBlock(movedStatements)
+        }
+    }
+
+    private fun IrExpression.transformSingleReturnBlock(movedStatements: MutableList<IrStatement>) =
+        this.safeAs<IrReturnableBlock>()?.apply {
+            val returnStatement = statements.last().safeAs<IrReturn>()
+            if (isSingleReturnBlock() && returnStatement?.returnTargetSymbol == this.symbol) {
+                movedStatements.addAll(statements.filterUnitStubs().dropLast(1))
+                statements.removeAll { it != returnStatement }
+            }
+        } ?: this
+
+    private fun IrFunctionAccessExpression.prepareValueArguments(movedStatements: MutableList<IrStatement>) = this.apply {
+        transformValueArguments {
+            it.transformSingleReturnBlock(movedStatements)
+            it.destructureIfIsOnlyReturnStatement()
         }
     }
 
