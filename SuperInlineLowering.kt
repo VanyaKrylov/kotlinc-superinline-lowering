@@ -28,6 +28,7 @@ import org.jetbrains.kotlin.ir.visitors.*
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.util.OperatorNameConventions
 import org.jetbrains.kotlin.utils.addToStdlib.safeAs
+import kotlin.math.exp
 
 
 // TODO:
@@ -374,7 +375,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
             val needsCapturing = !isFirstInvocation || parentInliner?.needsCapturing ?: true
             isFirstInvocation = false
 
-            expression.transformChildrenVoid() //same as in SuperInlineLowering (transformer) - we are walking the IR tree depth-first
+            expression.transformChildrenVoid() //we are walking the IR tree depth-first
 
             val callee = expression.symbol.owner
             val parent = allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull()
@@ -554,42 +555,198 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         override fun visitVariable(declaration: IrVariable): IrStatement {
             declaration.transformChildrenVoid()
 
-            if (isInlinedInitializer(declaration.initializer)) {
-                val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(declaration.type, declaration.name.toString())
-                val initializer = declaration.initializer.safeAs()
-                    ?: (declaration.initializer as IrBlock).statements.last() as IrReturnableBlock
+            val movedStatements = mutableListOf<IrStatement>()
+            val newInitializer = declaration.initializer?.transform(object : IrElementTransformerVoid() {
+                override fun visitBlock(expression: IrBlock): IrExpression {
+                    expression.transformChildrenVoid()
 
-                initializer.transformChildren(object : IrElementTransformerVoid() {
-                    override fun visitReturn(expression: IrReturn): IrExpression {
+                    if (!expression.isInlinedBlock())
+                        return expression
+
+                    val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(
+                        expression.type,
+                        expression.origin?.safeAs<SuperInlinedFunctionBodyOrigin>()?.calleeName
+                    )
+
+                    val irReturnableBlock = expression as IrReturnableBlock
+
+                    irReturnableBlock.transformChildren(object : IrElementTransformerVoid() {
+                        override fun visitReturn(expression: IrReturn): IrExpression {
 //                        expression.transformChildrenVoid() //theoretically we shouldn't face situations with nested returns with same returnSymbol
-                        return if (expression.returnTargetSymbol == initializer.symbol)
-                            IrSetValueImpl(
-                                expression.startOffset,
-                                expression.endOffset,
-                                expression.value.type,
-                                tmpVar.symbol,
-                                expression.value,
-                                null
-                            )
-                        else
-                            expression
-                    }
-                }, null)
+                            return if (expression.returnTargetSymbol == irReturnableBlock.symbol)
+                                IrSetValueImpl(
+                                    expression.startOffset,
+                                    expression.endOffset,
+                                    expression.value.type,
+                                    tmpVar.symbol,
+                                    expression.value,
+                                    null
+                                )
+                            else
+                                expression
+                        }
+                    }, null)
 
-                postProcessingEvaluationStatements.add(0, tmpVar)
+                    movedStatements.addAll(0, irReturnableBlock.statements)
+                    postProcessingEvaluationStatements.add(0, tmpVar)
 
-                val irBuilder = context.createIrBuilder(declaration.symbol, declaration.startOffset, declaration.endOffset)
-
-                return irBuilder.irComposite(origin = SuperInlinedFunctionBodyOrigin("")) {
-                    initializer.statements.forEach { +it }
-                    +declaration.apply {
-                        this.initializer = IrGetValueImpl(initializer.startOffset, initializer.endOffset, tmpVar.symbol, null)
-                    }
+                    return IrGetValueImpl(irReturnableBlock.startOffset, irReturnableBlock.endOffset, tmpVar.symbol, null)
                 }
+            }, null)
+
+            val irBuilder = context.createIrBuilder(declaration.symbol, declaration.startOffset, declaration.endOffset)
+
+            return if (movedStatements.isNotEmpty())
+                irBuilder.irComposite(origin = SuperInlinedFunctionBodyOrigin("")) {
+                    movedStatements.forEach { +it }
+                    +declaration.apply { initializer = newInitializer }
+                }
+            else
+                declaration
+        }
+
+        override fun visitBlock(expression: IrBlock): IrExpression {
+            expression.transformChildrenVoid()
+
+            val firstStatement = expression.statements[0].safeAs<IrCompositeImpl>() ?: expression
+            if (firstStatement.origin !is SuperInlinedFunctionBodyOrigin)
+                return expression
+
+            val variableDeclaration = firstStatement.statements.last().safeAs<IrVariable>() ?: return expression
+            expression.statements.apply {
+                removeAt(0)
+                add(0, variableDeclaration)
             }
 
-            return declaration
+            return IrCompositeImpl(
+                expression.startOffset,
+                expression.endOffset,
+                expression.type,
+                expression.origin,
+                firstStatement.statements.apply {
+                    removeLast()
+                    add(expression)
+                }
+            )
         }
+
+        override fun visitSetValue(expression: IrSetValue): IrExpression {
+            expression.transformChildrenVoid()
+
+            if (!expression.value.isInlinedBlock())
+                return expression
+
+            val irReturnableBlock = expression.value.safeAs<IrReturnableBlock>() ?: return expression
+
+            val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(
+                expression.value.type,
+                irReturnableBlock.origin?.safeAs<SuperInlinedFunctionBodyOrigin>()?.calleeName
+            )
+
+            postProcessingEvaluationStatements.add(0, tmpVar)
+
+            irReturnableBlock.transformChildren(object : IrElementTransformerVoid() {
+                override fun visitReturn(expression: IrReturn): IrExpression {
+                    return if (expression.returnTargetSymbol == irReturnableBlock.symbol)
+                        IrSetValueImpl(
+                            expression.startOffset,
+                            expression.endOffset,
+                            expression.value.type,
+                            tmpVar.symbol,
+                            expression.value,
+                            null
+                        )
+                    else
+                        expression
+                }
+            }, null)
+            expression.value = IrGetValueImpl(irReturnableBlock.startOffset, irReturnableBlock.endOffset, tmpVar.symbol, null)
+
+            return IrCompositeImpl(
+                expression.startOffset,
+                expression.endOffset,
+                expression.type,
+                expression.origin,
+                irReturnableBlock.statements.apply { add(expression) }
+            )
+        }
+
+        /*override fun visitLoop(loop: IrLoop): IrExpression {
+            loop.transformChildrenVoid()
+
+            val body = loop.body?.safeAs<IrBlock>() ?: return loop
+            val firstStatementComposite = body.statements[0].safeAs<IrComposite>() ?: return loop
+
+            if (body.origin != IrStatementOrigin.FOR_LOOP || firstStatementComposite.origin !is SuperInlinedFunctionBodyOrigin)
+                return loop
+
+            val variableDeclaration = firstStatementComposite.statements.last().safeAs<IrVariable>() ?: return loop
+            body.statements.apply {
+                removeAt(0)
+                add(0, variableDeclaration)
+            }
+
+            return IrCompositeImpl(
+                loop.startOffset,
+                loop.endOffset,
+                loop.type,
+                loop.origin,
+                firstStatementComposite.statements.apply {
+                    removeLast()
+                    add(loop)
+                }
+            )
+        }
+*/
+        /*override fun visitLoop(loop: IrLoop): IrExpression {
+            loop.body?.transformChildrenVoid()
+
+            val movedStatements = mutableListOf<IrStatement>()
+            loop.condition.transformChildren(object : IrElementTransformerVoid() {
+                override fun visitBlock(expression: IrBlock): IrExpression {
+                    expression.transformChildrenVoid()
+
+                    if (!expression.isInlinedBlock())
+                        return expression
+
+                    val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(
+                        expression.type,
+                        expression.origin?.safeAs<SuperInlinedFunctionBodyOrigin>()?.calleeName
+                    )
+
+                    val irReturnableBlock = expression as IrReturnableBlock
+
+                    irReturnableBlock.transformChildren(object : IrElementTransformerVoid() {
+                        override fun visitReturn(expression: IrReturn): IrExpression {
+//                        expression.transformChildrenVoid() //theoretically we shouldn't face situations with nested returns with same returnSymbol
+                            return if (expression.returnTargetSymbol == irReturnableBlock.symbol)
+                                IrSetValueImpl(
+                                    expression.startOffset,
+                                    expression.endOffset,
+                                    expression.value.type,
+                                    tmpVar.symbol,
+                                    expression.value,
+                                    null
+                                )
+                            else
+                                expression
+                        }
+                    }, null)
+
+                    movedStatements.addAll(0, irReturnableBlock.statements)
+                    postProcessingEvaluationStatements.add(0, tmpVar)
+
+                    return IrGetValueImpl(irReturnableBlock.startOffset, irReturnableBlock.endOffset, tmpVar.symbol, null)
+                }
+            }, null)
+
+            return IrCompositeImpl(
+                loop.startOffset,
+                loop.endOffset,
+                loop.type,
+                SuperInlinedFunctionBodyOrigin(""),
+                movedStatements.apply { add(loop) })
+        }*/
     }
 
     private fun IrReturnableBlock.flattenAndPatchReturnTargetSymbol() = apply {
