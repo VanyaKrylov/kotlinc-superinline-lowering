@@ -552,7 +552,7 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
     private inner class InliningPostProcessingTransformer(val containerScope: ScopeWithIr) : IrElementTransformerVoid() {
 
-        override fun visitVariable(declaration: IrVariable): IrStatement {
+        /*override fun visitVariable(declaration: IrVariable): IrStatement {
             declaration.transformChildrenVoid()
 
             val movedStatements = mutableListOf<IrStatement>()
@@ -603,6 +603,79 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
                 }
             else
                 declaration
+        }*/
+
+        override fun visitVariable(declaration: IrVariable): IrStatement {
+            declaration.transformChildrenVoid()
+
+            if (isInlinedInitializer(declaration.initializer)) {
+                val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(declaration.type, declaration.name.toString())
+                val initializer = declaration.initializer.safeAs()
+                    ?: (declaration.initializer as IrBlock).statements.last() as IrReturnableBlock
+
+                initializer.transformChildren(object : IrElementTransformerVoid() {
+                    override fun visitReturn(expression: IrReturn): IrExpression {
+//                        expression.transformChildrenVoid() //theoretically we shouldn't face situations with nested returns with same returnSymbol
+                        return if (expression.returnTargetSymbol == initializer.symbol)
+                            IrSetValueImpl(
+                                expression.startOffset,
+                                expression.endOffset,
+                                expression.value.type,
+                                tmpVar.symbol,
+                                expression.value,
+                                null
+                            )
+                        else
+                            expression
+                    }
+                }, null)
+
+                postProcessingEvaluationStatements.add(0, tmpVar)
+
+                val irBuilder = context.createIrBuilder(declaration.symbol, declaration.startOffset, declaration.endOffset)
+
+                return irBuilder.irComposite(origin = SuperInlinedFunctionBodyOrigin("")) {
+                    initializer.statements.forEach { +it }
+                    +declaration.apply {
+                        this.initializer = IrGetValueImpl(initializer.startOffset, initializer.endOffset, tmpVar.symbol, null)
+                    }
+                }
+            }
+
+            val initializer = declaration.initializer.safeAs<IrCall>() ?: return declaration
+            val dispatchReceiver = initializer.dispatchReceiver.safeAs<IrReturnableBlock>() ?: return declaration
+
+            if (!dispatchReceiver.isInlinedBlock())
+                return declaration
+
+            val tmpVar = containerScope.scope.createTemporaryVariableDeclaration(dispatchReceiver.type, declaration.name.toString())
+
+            dispatchReceiver.transformChildren(object : IrElementTransformerVoid() {
+                override fun visitReturn(expression: IrReturn): IrExpression {
+//                        expression.transformChildrenVoid() //theoretically we shouldn't face situations with nested returns with same returnSymbol
+                    return if (expression.returnTargetSymbol == dispatchReceiver.symbol)
+                        IrSetValueImpl(
+                            expression.startOffset,
+                            expression.endOffset,
+                            expression.value.type,
+                            tmpVar.symbol,
+                            expression.value,
+                            null
+                        )
+                    else
+                        expression
+                }
+            }, null)
+
+            postProcessingEvaluationStatements.add(0, tmpVar)
+            initializer.dispatchReceiver = IrGetValueImpl(dispatchReceiver.startOffset, dispatchReceiver.endOffset, tmpVar.symbol, null)
+
+            val irBuilder = context.createIrBuilder(declaration.symbol, declaration.startOffset, declaration.endOffset)
+
+            return irBuilder.irComposite(origin = SuperInlinedFunctionBodyOrigin("")) {
+                dispatchReceiver.statements.forEach { +it }
+                +declaration
+            }
         }
 
         override fun visitBlock(expression: IrBlock): IrExpression {
