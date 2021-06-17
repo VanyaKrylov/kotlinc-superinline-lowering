@@ -35,7 +35,7 @@ import kotlin.math.exp
 // 1) Add captured variables support in Inliner via isTopLevelCallSite checks
 class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass, IrElementTransformerVoidWithContext() {
     private val superInlineAnnotationFqName: FqName = FqName("Script.SuperInline")
-    private val superInlineAnnotationFqNameForCommandLine: FqName = FqName("SuperInline") //todo add/remove ik.
+    private val superInlineAnnotationFqNameForCommandLine: FqName = FqName("ik.SuperInline") //todo add/remove ik.
     private val IrFunction.needsInlining get() = this.isInline && !this.isExternal && this !is IrLazyFunction
     private var containerScope: ScopeWithIr? = null
     private var inliningTriggered: Boolean = false
@@ -59,6 +59,8 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
 
         containerScope = null
         inliningTriggered = false
+        postProcessingEvaluationStatements.clear()
+        capturedVariables.clear()
 
         irBody.patchDeclarationParents(container as? IrDeclarationParent ?: container.parent)
     }
@@ -110,7 +112,6 @@ class SuperInlineLowering(val context: CommonBackendContext) : BodyLoweringPass,
         val extensionReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = true)
         val dispatchReceiverInliningTransformer = ReceiverInliningTransformer(isExtension = false)
 
-        //TODO: make lazy
         val copyIrElement = run {
             val typeParameters =
                 if (callee is IrConstructor)
